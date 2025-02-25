@@ -1,6 +1,7 @@
 /// Bitcoin wallet using FROST/ChillDKG with multi-process architecture
 pub mod error;
 pub mod types;
+mod process;
 
 use bitcoin::Network;
 use crate::error::{FrostWalletError, Result};
