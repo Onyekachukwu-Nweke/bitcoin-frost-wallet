@@ -69,6 +69,7 @@ pub enum IpcMessage {
     Dkg(DkgMessage),
     /// Signing-related messages
     Signing(SigningMessage),
+    Handshake(Identifier<frost_secp256k1::Secp256K1Sha256>),
     /// Error message
     Error(String),
     /// Success message with optional data

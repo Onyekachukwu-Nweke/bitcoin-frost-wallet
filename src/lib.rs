@@ -2,6 +2,7 @@
 pub mod error;
 pub mod types;
 mod process;
+mod ipc;
 
 use bitcoin::Network;
 use crate::error::{FrostWalletError, Result};
