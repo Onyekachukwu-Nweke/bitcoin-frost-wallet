@@ -62,6 +62,64 @@ impl Participant {
     }
 }
 
+/// Message types for inter-process communication
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcMessage {
+    /// DKG-related messages
+    Dkg(DkgMessage),
+    /// Signing-related messages
+    Signing(SigningMessage),
+    Handshake(Identifier<frost_secp256k1::Secp256K1Sha256>),
+    /// Error message
+    Error(String),
+    /// Success message with optional data
+    Success(Option<Vec<u8>>),
+}
+
+/// Messages for distributed key generation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DkgMessage {
+    /// Start a new DKG round
+    Start(ThresholdConfig),
+    /// Share a commitment with all participants
+    Commitment(Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>),
+    /// Share a key with a specific participant
+    KeyShare(Identifier<frost_secp256k1::Secp256K1Sha256>, Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>),
+    /// Finish the DKG process
+    Finish,
+}
+
+/// Messages for distributed signing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SigningMessage {
+    /// Start a new signing round for a message
+    Start {
+        /// The message to sign
+        message: Vec<u8>,
+        /// Participants involved in signing
+        signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>>,
+    },
+    /// Nonce/commitment for round 1
+    Round1 {
+        /// Participant ID
+        id: Identifier<frost_secp256k1::Secp256K1Sha256>,
+        /// Commitment data
+        commitment: Vec<u8>,
+    },
+    /// Signature share for round 2
+    Round2 {
+        /// Participant ID
+        id: Identifier<frost_secp256k1::Secp256K1Sha256>,
+        /// Signature share data
+        signature_share: Vec<u8>,
+    },
+    /// Finalize signing by aggregating signature shares
+    Finalize {
+        /// All signature shares to aggregate
+        shares: Vec<(Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>)>,
+    },
+}
+
 /// Wallet configuration and state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConfig {
@@ -89,4 +147,51 @@ impl WalletConfig {
         self.storage_path = Some(path);
         self
     }
+}
+
+/// Process state for a participant
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProcessState {
+    /// Process is initializing
+    Initializing,
+    /// Process is ready for DKG
+    ReadyForDkg,
+    /// DKG is in progress
+    DkgInProgress {
+        /// Current round number
+        round: u8,
+    },
+    /// DKG is complete
+    DkgComplete,
+    /// Process is ready for signing
+    ReadyForSigning,
+    /// Signing is in progress
+    SigningInProgress {
+        /// Current round number
+        round: u8,
+    },
+    /// Process has encountered an error
+    Error(String),
+}
+
+/// Transaction signing request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningRequest {
+    /// Transaction to sign
+    pub transaction: Transaction,
+    /// Input index to sign
+    pub input_index: usize,
+    /// Input value in satoshis
+    pub input_value: u64,
+    /// Participants that will sign
+    pub signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>>,
+}
+
+/// Transaction signing result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningResult {
+    /// Final signature
+    pub signature: Signature,
+    /// Public key that can verify this signature
+    pub public_key: Vec<u8>,
 }
