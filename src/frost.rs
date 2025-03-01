@@ -50,17 +50,17 @@ impl FrostCoordinator {
     }
 
     /// Get a participant by ID
-    pub fn get_participant(&self, id: Identifier) -> Option<&Participant> {
+    pub fn get_participant(&self, id: Identifier<frost_secp256k1::Secp256K1Sha256>) -> Option<&Participant> {
         self.participants.get(&id)
     }
 
     /// Get a mutable participant by ID
-    pub fn get_participant_mut(&mut self, id: Identifier) -> Option<&mut Participant> {
+    pub fn get_participant_mut(&mut self, id: Identifier<frost_secp256k1::Secp256K1Sha256>) -> Option<&mut Participant> {
         self.participants.get_mut(&id)
     }
 
     /// Get all participants
-    pub fn get_participants(&self) -> &HashMap<Identifier, Participant> {
+    pub fn get_participants(&self) -> &HashMap<Identifier<frost_secp256k1::Secp256K1Sha256>, Participant> {
         &self.participants
     }
 
@@ -72,7 +72,7 @@ impl FrostCoordinator {
     }
 
     /// Generate signing commitments (Round 1)
-    pub fn generate_commitments(&self, participant_id: Identifier) -> Result<(SigningCommitments, SigningNonces)> {
+    pub fn generate_commitments(&self, participant_id: Identifier<frost_secp256k1::Secp256K1Sha256>) -> Result<(SigningCommitments, SigningNonces)> {
         let participant = self.get_participant(participant_id)
             .ok_or_else(|| FrostWalletError::ParticipantNotFound(participant_id))?;
 
@@ -93,7 +93,7 @@ impl FrostCoordinator {
     }
 
     /// Add commitments from a participant (Round 1)
-    pub fn add_commitments(&mut self, participant_id: Identifier, commitments: SigningCommitments) -> Result<()> {
+    pub fn add_commitments(&mut self, participant_id: Identifier<frost_secp256k1::Secp256K1Sha256>, commitments: SigningCommitments) -> Result<()> {
         if let Some(commitments_map) = &mut self.commitments {
             commitments_map.insert(participant_id, commitments);
             Ok(())
@@ -116,7 +116,7 @@ impl FrostCoordinator {
     /// Generate a signature share (Round 2)
     pub fn generate_signature_share(
         &self,
-        participant_id: Identifier,
+        participant_id: Identifier<frost_secp256k1::Secp256K1Sha256>,
         nonces: &SigningNonces,
         signing_package: &SigningPackage<SigningCommitments>,
     ) -> Result<SignatureShare> {
@@ -140,7 +140,7 @@ impl FrostCoordinator {
     pub fn aggregate_signatures(
         &self,
         signing_package: &SigningPackage<SigningCommitments>,
-        signature_shares: &BTreeMap<Identifier, SignatureShare>,
+        signature_shares: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SignatureShare>,
     ) -> Result<Signature> {
         let pub_key_package = self.pub_key_package.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("No public key package available".to_string()))?;
@@ -181,7 +181,7 @@ pub struct FrostUtil;
 
 impl FrostUtil {
     /// Generate key packages using the dealer-based keygen
-    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier, KeyPackage>, PublicKeyPackage)> {
+    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>, PublicKeyPackage)> {
         // Convert from our domain model to FROST parameters
         let min_signers = config.threshold;
         let max_signers = config.total_participants;
@@ -206,10 +206,10 @@ impl FrostUtil {
 
     /// Sign a message using a single-process workflow (for testing)
     pub fn sign_message(
-        key_packages: &BTreeMap<Identifier, KeyPackage>,
+        key_packages: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>,
         pub_key_package: &PublicKeyPackage,
         message: &[u8],
-        signers: &[Identifier],
+        signers: &[Identifier<frost_secp256k1::Secp256K1Sha256>],
     ) -> Result<Signature> {
         if signers.len() < key_packages.len() / 2 + 1 {
             return Err(FrostWalletError::NotEnoughSigners {
@@ -308,7 +308,7 @@ mod tests {
 
         // Sign a message with 2 signers
         let message = b"Test message";
-        let signers: Vec<Identifier> = key_packages.keys().copied().take(2).collect();
+        let signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>> = key_packages.keys().copied().take(2).collect();
 
         let signature = FrostUtil::sign_message(&key_packages, &pub_key_package, message, &signers).unwrap();
 
@@ -332,7 +332,7 @@ mod tests {
 
         // Try to sign with only 1 signer (below threshold)
         let message = b"Test message";
-        let signers: Vec<Identifier> = key_packages.keys().copied().take(1).collect();
+        let signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>> = key_packages.keys().copied().take(1).collect();
 
         let result = FrostUtil::sign_message(&key_packages, &pub_key_package, message, &signers);
 
@@ -362,7 +362,7 @@ mod tests {
         coordinator.start_signing(message.clone()).unwrap();
 
         // Get participant IDs
-        let participant_ids: Vec<Identifier> = coordinator.get_participants().keys().copied().take(2).collect();
+        let participant_ids: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>> = coordinator.get_participants().keys().copied().take(2).collect();
 
         // Round 1: Generate and collect commitments
         let mut nonces_map = HashMap::new();
