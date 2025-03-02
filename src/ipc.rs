@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::error::{FrostWalletError, Result};
 use crate::types::{DkgMessage, IpcMessage, SigningMessage, ThresholdConfig};
 use frost_core::Identifier;

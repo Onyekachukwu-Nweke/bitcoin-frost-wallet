@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use frost_core::{Identifier, Error as FrostError};
 use thiserror::Error;
 use std::io;

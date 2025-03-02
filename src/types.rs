@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use bitcoin::{Address, Network, Transaction};
 use frost_core::{Identifier, Scalar};
 use frost_secp256k1::{
