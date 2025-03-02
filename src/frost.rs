@@ -82,6 +82,8 @@ impl FrostCoordinator {
         let key_package = participant.key_package.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("Participant has no key package".to_string()))?;
 
+        // key_package = key_package.secret_share();
+
         let signing_share = key_package.signing_share();
 
         let (nonces, commitments) = frost_secp256k1::round1::commit(
@@ -180,7 +182,7 @@ pub struct FrostUtil;
 
 impl FrostUtil {
     /// Generate key packages using the dealer-based keygen
-    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SecretShare>, PublicKeyPackage)> {
+    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>, PublicKeyPackage)> {
         let min_signers = config.threshold;
         let max_signers = config.total_participants;
 
@@ -191,12 +193,21 @@ impl FrostUtil {
             &mut OsRng,
         ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
-        Ok((secret_shares, public_key_package))
+        let key_packages: BTreeMap<_, _> = secret_shares.into_iter()
+            .map(|(id, ss)| {
+                let key_package = KeyPackage::try_from(ss)
+                    .map_err(|e| FrostWalletError::FrostError("Failed to convert to KeyPackage".to_string()))
+                    .unwrap();
+                (id, key_package)
+            })
+            .collect();
+
+        Ok((key_packages, public_key_package))
     }
 
     /// Sign a message using a single-process workflow (for testing)
     pub fn sign_message(
-        key_packages: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SecretShare>,
+        key_packages: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>,
         pub_key_package: &PublicKeyPackage,
         message: &[u8],
         signers: &[Identifier<frost_secp256k1::Secp256K1Sha256>],
@@ -236,6 +247,8 @@ impl FrostUtil {
         for &signer_id in signers {
             let key_package = key_packages.get(&signer_id)
                 .ok_or_else(|| FrostWalletError::ParticipantNotFound(signer_id))?;
+
+            // key_package = KeyPackage::try_from(key_package).unwrap_or();
 
             let nonces = nonces_map.get(&signer_id)
                 .ok_or_else(|| FrostWalletError::InvalidState("Missing nonces".to_string()))?;
