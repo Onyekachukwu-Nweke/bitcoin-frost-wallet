@@ -1,15 +1,16 @@
+#![allow(warnings)]
 use crate::error::{FrostWalletError, Result};
 use crate::types::{Participant, ThresholdConfig};
 use frost_core::{
-    Identifier, SigningPackage, VerifyingKey,
+    Identifier, SigningPackage, VerifyingKey
 };
 use frost_secp256k1::{
-    keys::{KeyGenOptions, KeyPackage, PublicKeyPackage, SecretShare, SigningShare},
+    keys::{IdentifierList, KeyPackage, PublicKeyPackage, SigningShare, SecretShare},
     round1::{SigningCommitments, SigningNonces},
     round2::SignatureShare,
     Signature,
 };
-use rand::rngs::OsRng;
+use rand_core::{OsRng};
 use serde::{Serialize, Deserialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -73,18 +74,17 @@ impl FrostCoordinator {
 
     /// Generate signing commitments (Round 1)
     pub fn generate_commitments(&self, participant_id: Identifier<frost_secp256k1::Secp256K1Sha256>) -> Result<(SigningCommitments, SigningNonces)> {
+        // let mut rng = thread_rng();
+
         let participant = self.get_participant(participant_id)
             .ok_or_else(|| FrostWalletError::ParticipantNotFound(participant_id))?;
 
         let key_package = participant.key_package.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("Participant has no key package".to_string()))?;
 
-        let signing_share = SigningShare::from_bytes(
-            key_package.secret_share().signing_share().to_bytes()
-        ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
+        let signing_share = key_package.signing_share();
 
-        let (commitments, nonces) = frost_secp256k1::round1::commit(
-            participant_id,
+        let (nonces, commitments) = frost_secp256k1::round1::commit(
             &signing_share,
             &mut OsRng,
         );
@@ -103,7 +103,7 @@ impl FrostCoordinator {
     }
 
     /// Create a signing package for Round 2
-    pub fn create_signing_package(&self) -> Result<SigningPackage<SigningCommitments>> {
+    pub fn create_signing_package(&self) -> Result<SigningPackage<frost_secp256k1::Secp256K1Sha256>> {
         let commitments = self.commitments.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("No commitments available".to_string()))?;
 
@@ -118,7 +118,7 @@ impl FrostCoordinator {
         &self,
         participant_id: Identifier<frost_secp256k1::Secp256K1Sha256>,
         nonces: &SigningNonces,
-        signing_package: &SigningPackage<SigningCommitments>,
+        signing_package: &SigningPackage<frost_secp256k1::Secp256K1Sha256>,
     ) -> Result<SignatureShare> {
         let participant = self.get_participant(participant_id)
             .ok_or_else(|| FrostWalletError::ParticipantNotFound(participant_id))?;
@@ -127,10 +127,9 @@ impl FrostCoordinator {
             .ok_or_else(|| FrostWalletError::InvalidState("Participant has no key package".to_string()))?;
 
         let signature_share = frost_secp256k1::round2::sign(
-            key_package,
-            nonces,
             signing_package,
-            signing_package.message(),
+            nonces,
+            key_package,
         ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
         Ok(signature_share)
@@ -139,17 +138,16 @@ impl FrostCoordinator {
     /// Aggregate signature shares
     pub fn aggregate_signatures(
         &self,
-        signing_package: &SigningPackage<SigningCommitments>,
+        signing_package: &SigningPackage<frost_secp256k1::Secp256K1Sha256>,
         signature_shares: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SignatureShare>,
     ) -> Result<Signature> {
         let pub_key_package = self.pub_key_package.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("No public key package available".to_string()))?;
 
         let signature = frost_secp256k1::aggregate(
-            pub_key_package.verifying_key(),
             signing_package,
             signature_shares,
-            signing_package.message(),
+            pub_key_package,
         ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
         Ok(signature)
@@ -160,13 +158,14 @@ impl FrostCoordinator {
         let pub_key_package = self.pub_key_package.as_ref()
             .ok_or_else(|| FrostWalletError::InvalidState("No public key package available".to_string()))?;
 
-        let result = frost_secp256k1::verify(
+        let is_valid = VerifyingKey::verify(
             pub_key_package.verifying_key(),
             message,
             signature,
-        ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
+        ).map(|()| true) // If verification succeeds, return true
+         .unwrap_or(false); // If verification fails, return false
 
-        Ok(result)
+        Ok(is_valid)
     }
 
     /// Clear the current signing session
@@ -181,32 +180,23 @@ pub struct FrostUtil;
 
 impl FrostUtil {
     /// Generate key packages using the dealer-based keygen
-    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>, PublicKeyPackage)> {
-        // Convert from our domain model to FROST parameters
+    pub fn generate_keys(config: &ThresholdConfig) -> Result<(BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SecretShare>, PublicKeyPackage)> {
         let min_signers = config.threshold;
         let max_signers = config.total_participants;
 
-        let frost_config = frost_secp256k1::ThresholdParameters::new(min_signers, max_signers)
-            .map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
-
-        // Generate key shares
-        let (key_packages, participants) = frost_secp256k1::keys::generate_with_dealer(
-            frost_config,
-            KeyGenOptions::default(),
+        let (secret_shares, public_key_package) = frost_secp256k1::keys::generate_with_dealer(
+            max_signers,
+            min_signers,
+            IdentifierList::Default,
             &mut OsRng,
         ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
-        // Get the public key package (same for all participants)
-        let pub_key_package = key_packages.values().next()
-            .map(|kp| kp.public_key_package().clone())
-            .ok_or_else(|| FrostWalletError::FrostError("Failed to get public key package".to_string()))?;
-
-        Ok((key_packages, pub_key_package))
+        Ok((secret_shares, public_key_package))
     }
 
     /// Sign a message using a single-process workflow (for testing)
     pub fn sign_message(
-        key_packages: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, KeyPackage>,
+        key_packages: &BTreeMap<Identifier<frost_secp256k1::Secp256K1Sha256>, SecretShare>,
         pub_key_package: &PublicKeyPackage,
         message: &[u8],
         signers: &[Identifier<frost_secp256k1::Secp256K1Sha256>],
@@ -226,12 +216,9 @@ impl FrostUtil {
             let key_package = key_packages.get(&signer_id)
                 .ok_or_else(|| FrostWalletError::ParticipantNotFound(signer_id))?;
 
-            let signing_share = SigningShare::from_bytes(
-                key_package.secret_share().signing_share().to_bytes()
-            ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
+            let signing_share = key_package.signing_share();
 
-            let (commitments, nonces) = frost_secp256k1::round1::commit(
-                signer_id,
+            let (nonces, commitments) = frost_secp256k1::round1::commit(
                 &signing_share,
                 &mut OsRng,
             );
@@ -254,10 +241,9 @@ impl FrostUtil {
                 .ok_or_else(|| FrostWalletError::InvalidState("Missing nonces".to_string()))?;
 
             let signature_share = frost_secp256k1::round2::sign(
-                key_package,
-                nonces,
                 &signing_package,
-                message,
+                nonces,
+                key_package,
             ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
             signature_shares.insert(signer_id, signature_share);
@@ -265,10 +251,9 @@ impl FrostUtil {
 
         // Aggregate signature shares
         let signature = frost_secp256k1::aggregate(
-            pub_key_package.verifying_key(),
             &signing_package,
             &signature_shares,
-            message,
+            pub_key_package,
         ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
 
         Ok(signature)
@@ -276,15 +261,16 @@ impl FrostUtil {
 
     /// Verify a signature
     pub fn verify_signature(
-        verifying_key: &VerifyingKey,
+        pub_key_package: &PublicKeyPackage,
         message: &[u8],
         signature: &Signature,
     ) -> Result<bool> {
-        let result = frost_secp256k1::verify(
-            verifying_key,
+        let result = VerifyingKey::verify(
+            pub_key_package.verifying_key(),
             message,
             signature,
-        ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
+        ).map(|()| true) // If verification succeeds, return true
+         .unwrap_or(false); // If verification fails, return false
 
         Ok(result)
     }
@@ -314,7 +300,7 @@ mod tests {
 
         // Verify the signature
         let result = FrostUtil::verify_signature(
-            pub_key_package.verifying_key(),
+            &pub_key_package,
             message,
             &signature,
         ).unwrap();

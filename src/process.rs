@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::error::{FrostWalletError, Result};
 use crate::types::{IpcMessage, Participant, ProcessState};
 use frost_core::Identifier;

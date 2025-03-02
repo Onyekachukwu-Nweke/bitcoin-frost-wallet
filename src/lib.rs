@@ -1,4 +1,5 @@
 /// Bitcoin wallet using FROST/ChillDKG with multi-process architecture
+/// #![allow(warnings)]
 pub mod error;
 pub mod types;
 mod process;
