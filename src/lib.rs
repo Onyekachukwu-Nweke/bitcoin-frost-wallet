@@ -1,2 +1,2 @@
 pub mod common;
-pub mod dkg;
+pub mod frost_dkg;
