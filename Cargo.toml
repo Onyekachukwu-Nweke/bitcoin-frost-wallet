@@ -39,3 +39,9 @@ tokio-test = "0.4.4"
 default = ["std"]
 std = ["secp256k1/std"]
 #parallel = ["rayon"]
+
+[workspace]
+members = [
+    "common",
+    "dkg"
+]

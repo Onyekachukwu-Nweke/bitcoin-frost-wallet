@@ -1,2 +1,1 @@
-mod chilldkg;
-mod frost;
+pub mod frost;
