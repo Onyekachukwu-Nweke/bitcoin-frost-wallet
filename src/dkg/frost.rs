@@ -7,7 +7,6 @@ use frost_secp256k1::{
     round2::SignatureShare,
 };
 use rand_core::OsRng;
-use serde::{Serialize, Deserialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// FROST signing coordinator for threshold signing
@@ -77,7 +76,7 @@ impl FrostCoordinator {
             .ok_or_else(|| FrostWalletError::InvalidState("Participant has no key package".to_string()))?;
 
         // Use frost_secp256k1::round1::commit to generate commitments
-        let signing_share = key_package.secret_share().signing_share();
+        let signing_share = key_package.signing_share();
 
         let (nonces, commitments) = frost_secp256k1::round1::commit(
             signing_share,
@@ -173,7 +172,7 @@ impl FrostCoordinator {
     }
 }
 
-/// Utility functions for FROST signing
+/// Utility functions for FROST signing in single-process testing
 pub struct FrostSigner;
 
 impl FrostSigner {
@@ -185,9 +184,7 @@ impl FrostSigner {
         signers: &[Identifier],
     ) -> Result<Signature> {
         // Verify we have enough signers
-        let min_signers = key_packages.values().next()
-            .map(|kp| kp.parameters().min_signers())
-            .unwrap_or(0);
+        let min_signers = (key_packages.len() / 2 + 1) as u16;
 
         if signers.len() < min_signers as usize {
             return Err(FrostWalletError::NotEnoughSigners {
@@ -204,7 +201,7 @@ impl FrostSigner {
             let key_package = key_packages.get(&signer_id)
                 .ok_or_else(|| FrostWalletError::ParticipantNotFound(signer_id))?;
 
-            let signing_share = key_package.secret_share().signing_share();
+            let signing_share = key_package.signing_share();
 
             // Generate commitments using frost_secp256k1::round1::commit
             let (nonces, commitments) = frost_secp256k1::round1::commit(
@@ -270,22 +267,30 @@ impl FrostSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frost_core::Identifier;
-    use frost_secp256k1::keys::{KeyGenOptions, ThresholdParameters};
-    use frost_secp256k1::keys::dkg::{self, round1, round2};
+    // use frost_core::Identifier;
+    use frost_secp256k1::Identifier;
+    use frost_secp256k1::keys::{IdentifierList};
 
     // Helper function to generate key packages for testing
     fn generate_test_key_packages(threshold: u16, participants: u16) -> (BTreeMap<Identifier, KeyPackage>, PublicKeyPackage) {
-        let params = ThresholdParameters::new(threshold, participants)
-            .expect("Failed to create threshold parameters");
+        // let params = ThresholdParameters::new(threshold, participants)
+        //     .expect("Failed to create threshold parameters");
 
-        let (key_packages, _) = frost_secp256k1::keys::generate_with_dealer(
-            params,
-            KeyGenOptions::default(),
+        let (secret_shares, pub_key_package) = frost_secp256k1::keys::generate_with_dealer(
+            participants,
+            threshold,
+            IdentifierList::Default,
             &mut OsRng,
         ).expect("Failed to generate key packages");
 
-        let pub_key_package = key_packages.values().next().unwrap().public_key_package().clone();
+        let key_packages: BTreeMap<_, _> = secret_shares.into_iter()
+            .map(|(id, ss)| {
+                let key_package = KeyPackage::try_from(ss)
+                    .map_err(|e| FrostWalletError::FrostError("Failed to convert to KeyPackage".to_string()))
+                    .unwrap();
+                (id, key_package)
+            })
+            .collect();
 
         (key_packages, pub_key_package)
     }

@@ -40,8 +40,8 @@ default = ["std"]
 std = ["secp256k1/std"]
 #parallel = ["rayon"]
 
-[workspace]
-members = [
-    "common",
-    "dkg"
-]
+#[workspace]
+#members = [
+#    "common",
+#    "dkg"
+#]
