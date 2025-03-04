@@ -33,13 +33,15 @@ pub struct DkgCoordinator {
     /// Round 1 packages received from participants
     round1_packages: HashMap<Identifier, round1::Package>,
     /// Round 2 packages received from participants
-    round2_packages: HashMap<Identifier, round2::Package>,
+    round2_packages: BTreeMap<Identifier, round2::Package>,
     /// Final key packages after DKG
     key_packages: Option<BTreeMap<Identifier, KeyPackage>>,
     /// Final public key package
-    pub_key_package: Option<PublicKeyPackage>,
+    pub_key_package: Option<BTreeMap<Identifier, PublicKeyPackage>>,
     /// Local round1 secret for the local participant
-    local_round1_secret: Option<round1::SecretPackage>,
+    local_round1_secret: BTreeMap<Identifier, round1::SecretPackage>,
+    /// Local round2 secret for the local participant
+    local_round2_secret: BTreeMap<Identifier, round2::SecretPackage>,
 }
 
 impl DkgCoordinator {
@@ -50,10 +52,11 @@ impl DkgCoordinator {
             round_state: DkgRoundState::Round1,
             participants: HashMap::new(),
             round1_packages: HashMap::new(),
-            round2_packages: HashMap::new(),
+            round2_packages: BTreeMap::new(),
             key_packages: None,
             pub_key_package: None,
-            local_round1_secret: None,
+            local_round1_secret: BTreeMap::new(),
+            local_round2_secret: BTreeMap::new(),
         }
     }
 
@@ -103,7 +106,8 @@ impl DkgCoordinator {
         self.round2_packages.clear();
         self.key_packages = None;
         self.pub_key_package = None;
-        self.local_round1_secret = None;
+        self.local_round1_secret.clear();
+        self.local_round2_secret.clear();
 
         // Set initial state to Round 1
         self.round_state = DkgRoundState::Round1;
@@ -137,7 +141,7 @@ impl DkgCoordinator {
 
         // Store the secret if this is the local participant
         if participant_id == self.participants.iter().next().unwrap().0.clone() {
-            self.local_round1_secret = Some(round1_secret);
+            self.local_round1_secret.insert(participant_id, round1_secret);
         }
 
         // Store the package
@@ -191,24 +195,27 @@ impl DkgCoordinator {
         }
 
         // Get the local round 1 secret
-        let round1_secret = self.local_round1_secret.as_ref()
-            .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?;
+        let round1_secret = self.local_round1_secret.get(
+            &participant_id)
+            .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?.clone();
 
         // Get all round 1 packages
         let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages.clone().into_iter().collect();
 
         // Generate Round 2 data
-        let round2_package = round2::generate(
-            participant_id,
+        let (round2_secret, round2_package) = part2(
             round1_secret,
             &round1_packages,
-            &mut OsRng,
         ).map_err(|e| FrostWalletError::DkgError(format!("Round 2 generation error: {}", e)))?;
 
-        // Store the package
-        self.round2_packages.insert(participant_id, round2_package.clone());
+        self.local_round2_secret.insert(participant_id, round2_secret);
 
-        Ok(round2_package)
+        // Store the package
+        self.round2_packages = round2_package.clone();
+
+        Ok(round2_package.get(&participant_id).ok_or_else(|| {
+            FrostWalletError::DkgError("Round 2 package not found".to_string())
+        }).unwrap().clone())
     }
 
     /// Process a round 2 package from a participant
@@ -250,15 +257,9 @@ impl DkgCoordinator {
             ))),
         }
 
-        // Get the threshold parameters
-        let threshold_params = ThresholdParameters::new(
-            self.config.threshold,
-            self.config.total_participants,
-        ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
-
-        // Get the local round 1 secret
-        let round1_secret = self.local_round1_secret.as_ref()
-            .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?;
+        // Get the local round 2 secret
+        let round2_secret = self.local_round2_secret.get(&participant_id)
+            .ok_or_else(|| FrostWalletError::DkgError("No local round 2 secret".to_string()))?;
 
         // Get all round 1 packages
         let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages.clone().into_iter().collect();
@@ -267,16 +268,21 @@ impl DkgCoordinator {
         let round2_packages: BTreeMap<Identifier, round2::Package> = self.round2_packages.clone().into_iter().collect();
 
         // Verify and finalize
-        let (key_package, public_key_package) = dkg::finish(
-            participant_id,
-            threshold_params,
-            round1_secret,
+        let (key_package, public_key_package) = part3(
+            round2_secret,
             &round1_packages,
             &round2_packages,
         ).map_err(|e| FrostWalletError::DkgError(format!("DKG finalization error: {}", e)))?;
 
         // Store the public key package
-        self.pub_key_package = Some(public_key_package);
+        if self.pub_key_package.is_none() {
+            self.pub_key_package = Some(BTreeMap::new());
+        }
+
+        // Add the public key package to the map
+        self.pub_key_package.as_mut().unwrap().insert(participant_id, public_key_package.clone());
+
+        // self.pub_key_package = Some(public_key_package);
 
         // Create the key packages map if it doesn't exist
         if self.key_packages.is_none() {
@@ -307,7 +313,9 @@ impl DkgCoordinator {
     /// Get the public key package
     pub fn get_public_key_package(&self) -> Result<PublicKeyPackage> {
         match &self.pub_key_package {
-            Some(pkg) => Ok(pkg.clone()),
+            Some(pkg) => Ok(pkg.get(&self.participants.iter().next().unwrap().0).ok_or_else(|| {
+                FrostWalletError::DkgError("Public key package not found".to_string())
+            }).unwrap().clone()),
             None => Err(FrostWalletError::DkgError("DKG not yet complete".to_string())),
         }
     }
@@ -316,7 +324,7 @@ impl DkgCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frost_core::Identifier;
+    use frost_secp256k1::Identifier;
 
     #[test]
     fn test_dkg_coordinator() {
@@ -328,7 +336,7 @@ mod tests {
 
         // Add participants
         for i in 1..=3 {
-            let participant = Participant::new(Identifier::from(i as u16));
+            let participant = Participant::new(Identifier::try_from(i as u16).unwrap());
             coordinator.add_participant(participant).unwrap();
         }
 
@@ -340,7 +348,7 @@ mod tests {
 
         // Generate and process round 1 packages
         for i in 1..=3 {
-            let id = Identifier::from(i as u16);
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
             let package = coordinator.generate_round1(id).unwrap();
             coordinator.process_round1_package(id, package).unwrap();
         }
@@ -350,7 +358,7 @@ mod tests {
 
         // Generate and process round 2 packages
         for i in 1..=3 {
-            let id = Identifier::from(i as u16);
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
             let package = coordinator.generate_round2(id).unwrap();
             coordinator.process_round2_package(id, package).unwrap();
         }
@@ -360,7 +368,7 @@ mod tests {
 
         // Finalize DKG for each participant
         for i in 1..=3 {
-            let id = Identifier::from(i as u16);
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
             coordinator.finalize(id).unwrap();
         }
 
@@ -372,9 +380,9 @@ mod tests {
 
         // Verify key packages are available
         for i in 1..=3 {
-            let id = Identifier::from(i as u16);
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
             let key_package = coordinator.get_key_package(id).unwrap();
-            assert_eq!(key_package.public_key_package().verifying_key(), pub_key_package.verifying_key());
+            assert_eq!(key_package.verifying_key(), pub_key_package.verifying_key());
         }
     }
 }
