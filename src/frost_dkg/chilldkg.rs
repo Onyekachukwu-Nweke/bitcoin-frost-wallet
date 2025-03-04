@@ -5,7 +5,7 @@ use frost_secp256k1::{
     keys::{KeyPackage, PublicKeyPackage, SecretShare, dkg::{self, round1, round2, part1, part2, part3}},
 };
 use rand_core::OsRng;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{BTreeMap};
 
 /// State for a ChillDKG round
 #[derive(Debug, Clone)]
@@ -29,9 +29,9 @@ pub struct DkgCoordinator {
     /// Current round state
     round_state: DkgRoundState,
     /// Participants in the DKG
-    participants: HashMap<Identifier, Participant>,
+    participants: BTreeMap<Identifier, Participant>,
     /// Round 1 packages received from participants
-    round1_packages: HashMap<Identifier, round1::Package>,
+    round1_packages: BTreeMap<Identifier, round1::Package>,
     /// Round 2 packages received from participants
     round2_packages: BTreeMap<Identifier, round2::Package>,
     /// Final key packages after DKG
@@ -50,8 +50,8 @@ impl DkgCoordinator {
         Self {
             config,
             round_state: DkgRoundState::Round1,
-            participants: HashMap::new(),
-            round1_packages: HashMap::new(),
+            participants: BTreeMap::new(),
+            round1_packages: BTreeMap::new(),
             round2_packages: BTreeMap::new(),
             key_packages: None,
             pub_key_package: None,
@@ -81,7 +81,7 @@ impl DkgCoordinator {
     }
 
     /// Get all participants
-    pub fn get_participants(&self) -> &HashMap<Identifier, Participant> {
+    pub fn get_participants(&self) -> &BTreeMap<Identifier, Participant> {
         &self.participants
     }
 
@@ -144,7 +144,7 @@ impl DkgCoordinator {
             self.local_round1_secret.insert(participant_id, round1_secret);
         }
 
-        // Store the package
+        // // Store the package
         self.round1_packages.insert(participant_id, round1_package.clone());
 
         Ok(round1_package)
@@ -195,27 +195,76 @@ impl DkgCoordinator {
         }
 
         // Get the local round 1 secret
-        let round1_secret = self.local_round1_secret.get(
-            &participant_id)
+        let round1_secret = self.local_round1_secret.get(&participant_id)
             .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?.clone();
 
+        println!("Found local round1 secret for {:?}", round1_secret);
+
+        // Ensure we have the right number of round1 packages
+        if self.round1_packages.len() != self.participants.len() {
+            return Err(FrostWalletError::DkgError(format!(
+                "Not enough round 1 packages: have {}, need {}",
+                self.round1_packages.len(),
+                self.participants.len()
+            )));
+        }
+
+        // println!("round1_secret:{}, participants:{}", self.round1_packages.len(), self.participants.len());
+
+        // println!("{:?}", round1_secret);
+
         // Get all round 1 packages
-        let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages.clone().into_iter().collect();
+        // let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages.clone();
+        //
+        // print
+
+        println!("I am here");
+
+        // println!("Number of round1 packages: {}", self.round1_packages.len());
+        // println!("Expected participants: {}", self.participants.len());
+        // println!("Round1 packages: {:?}", self.round1_packages.values());
+        // println!("Current participant: {:?}", participant_id);
+        // println!("Round1 secret exists: {:?}", round1_secret);
+
+        let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages
+            .iter()
+            .filter(|(id, _)| **id != participant_id)  // Only include other participants' packages
+            .map(|(id, pkg)| (*id, pkg.clone()))
+            .collect();
+
+        // println!("Round1 packages content:");
+        // for (id, pkg) in &round1_packages {
+        //     println!("ID: {:?}", id);
+        //     println!("Min signers: {}", round1_secret.min_signers());
+        //     println!("Max signers: {}", round1_secret.max_signers());
+        //     println!("Package commitment values: {:?}", pkg.commitment());
+        // }
+
+        // println!("Round1 secret details:");
+        // println!("Identifier: {:?}", round1_secret.identifier());
+        // println!("Min signers from secret: {}", round1_secret.min_signers());
+        // println!("Max signers from secret: {}", round1_secret.max_signers());
 
         // Generate Round 2 data
-        let (round2_secret, round2_package) = part2(
+        let (round2_secret, round2_packages) = part2(
             round1_secret,
             &round1_packages,
         ).map_err(|e| FrostWalletError::DkgError(format!("Round 2 generation error: {}", e)))?;
 
+        println!("I am here 2");
+
+        println!("Round2 Packages: {:?}", round2_packages);
+
         self.local_round2_secret.insert(participant_id, round2_secret);
 
         // Store the package
-        self.round2_packages = round2_package.clone();
+        self.round2_packages = round2_packages.clone();
 
-        Ok(round2_package.get(&participant_id).ok_or_else(|| {
+        let round2_package = round2_packages.get(&participant_id).ok_or_else(|| {
             FrostWalletError::DkgError("Round 2 package not found".to_string())
-        }).unwrap().clone())
+        }).unwrap().clone();
+
+        Ok(round2_package)
     }
 
     /// Process a round 2 package from a participant
