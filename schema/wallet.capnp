@@ -55,31 +55,62 @@ struct Balance {
   total @3 :UInt64;
 }
 
+# Result type wrappers
+struct BoolResult {
+  success @0 :Bool;
+  error @1 :Common.Error;
+  value @2 :Bool;
+}
+
+struct AddressResult {
+  success @0 :Bool;
+  error @1 :Common.Error;
+  value @2 :Address;
+}
+
+struct TransactionResult {
+  success @0 :Bool;
+  error @1 :Common.Error;
+  value @2 :Transaction;
+}
+
+struct BalanceResult {
+  success @0 :Bool;
+  error @1 :Common.Error;
+  value @2 :Balance;
+}
+
+struct TextResult {
+  success @0 :Bool;
+  error @1 :Common.Error;
+  value @2 :Text;
+}
+
 interface BitcoinWallet {
   # Initialize wallet with configuration
-  initialize @0 (context :Common.Context, config :WalletConfig) -> (result :Common.Result(Bool));
+  initialize @0 (context :Common.Context, config :WalletConfig) -> (result :BoolResult);
 
   # Set the local key package from DKG
-  setKeyPackage @1 (context :Common.Context, keyPackage :Dkg.KeyPackage, pubKeyPackage :Dkg.PublicKeyPackage) -> (result :Common.Result(Bool));
+  setKeyPackage @1 (context :Common.Context, keyPackage :Dkg.KeyPackage, pubKeyPackage :Dkg.PublicKeyPackage) -> (result :BoolResult);
 
   # Get the wallet address
-  getAddress @2 (context :Common.Context) -> (result :Common.Result(Address));
+  getAddress @2 (context :Common.Context) -> (result :AddressResult);
 
   # Create a transaction
-  createTransaction @3 (context :Common.Context, request :TransactionRequest) -> (result :Common.Result(Transaction));
+  createTransaction @3 (context :Common.Context, request :TransactionRequest) -> (result :TransactionResult);
 
   # Sign a transaction using FROST
-  signTransaction @4 (context :Common.Context, tx :Transaction, signers :List(Common.Identifier)) -> (result :Common.Result(Transaction));
+  signTransaction @4 (context :Common.Context, tx :Transaction, signers :List(Common.Identifier)) -> (result :TransactionResult);
 
   # Broadcast a signed transaction to the network
-  broadcastTransaction @5 (context :Common.Context, tx :Transaction) -> (result :Common.Result(Text));
+  broadcastTransaction @5 (context :Common.Context, tx :Transaction) -> (result :TextResult);
 
   # Get wallet balance
-  getBalance @6 (context :Common.Context) -> (result :Common.Result(Balance));
+  getBalance @6 (context :Common.Context) -> (result :BalanceResult);
 
   # Save wallet state
-  save @7 (context :Common.Context) -> (result :Common.Result(Bool));
+  save @7 (context :Common.Context) -> (result :BoolResult);
 
   # Load wallet state
-  load @8 (context :Common.Context) -> (result :Common.Result(Bool));
+  load @8 (context :Common.Context) -> (result :BoolResult);
 }
