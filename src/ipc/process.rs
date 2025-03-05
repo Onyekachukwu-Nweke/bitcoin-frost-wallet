@@ -1,17 +1,17 @@
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{Participant, ProcessState};
-use frost_core::Identifier;
+use frost_secp256k1::Identifier;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use tokio::process::Command as TokioCommand;
+use std::process::{Child, Stdio};
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 /// Represents a participant process
 pub struct ParticipantProcess {
     /// Participant ID
     pub id: Identifier,
-    /// Process handle
-    pub process: Option<Child>,
+    /// Process handle (using tokio Child)
+    pub process: Option<TokioChild>,
     /// Path to the executable
     pub binary_path: PathBuf,
     /// Process state
@@ -45,7 +45,6 @@ impl ParticipantProcess {
             .map_err(|e| FrostWalletError::ProcessError(format!("Failed to spawn process: {}", e)))?;
 
         // Store process handle
-        let process = process.into_std();
         self.process = Some(process);
         self.state = ProcessState::Initializing;
 
@@ -53,7 +52,7 @@ impl ParticipantProcess {
     }
 
     /// Check if the process is running
-    pub fn is_running(&mut self) -> bool {
+    pub async fn is_running(&mut self) -> bool {
         if let Some(process) = &mut self.process {
             match process.try_wait() {
                 Ok(None) => true,        // Process is running
@@ -66,14 +65,16 @@ impl ParticipantProcess {
     }
 
     /// Terminate the process
-    pub fn terminate(&mut self) -> Result<()> {
+    pub async fn terminate(&mut self) -> Result<()> {
         if let Some(process) = &mut self.process {
             process
                 .kill()
+                .await
                 .map_err(|e| FrostWalletError::ProcessError(format!("Failed to terminate process: {}", e)))?;
 
             process
                 .wait()
+                .await
                 .map_err(|e| FrostWalletError::ProcessError(format!("Failed to wait for process: {}", e)))?;
 
             self.process = None;
@@ -119,16 +120,19 @@ impl ProcessCoordinator {
     }
 
     /// Check if all processes are running
-    pub fn all_running(&mut self) -> bool {
-        self.processes
-            .values_mut()
-            .all(|process| process.is_running())
+    pub async fn all_running(&mut self) -> bool {
+        for process in self.processes.values_mut() {
+            if !process.is_running().await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Terminate all processes
-    pub fn terminate_all(&mut self) -> Result<()> {
+    pub async fn terminate_all(&mut self) -> Result<()> {
         for (_, process) in self.processes.iter_mut() {
-            process.terminate()?;
+            process.terminate().await?;
         }
 
         Ok(())
