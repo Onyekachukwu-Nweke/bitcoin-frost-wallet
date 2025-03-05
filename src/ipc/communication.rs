@@ -211,7 +211,7 @@ impl IpcClient {
 
         self.stream = Some(stream);
 
-        let (read_half, write_half) = self.stream.as_ref().unwrap().split();
+        let (read_half, mut write_half) = self.stream.as_ref().unwrap().split();
 
         let (outgoing_tx, mut outgoing_rx) = channel::<IpcMessage>(100);
         let (incoming_tx, incoming_rx) = channel::<IpcMessage>(100);
@@ -230,7 +230,7 @@ impl IpcClient {
         // Spawn task to write outgoing messages
         tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
-                if let Err(e) = write_message(write_half, &message).await {
+                if let Err(e) = write_message(&mut write_half, &message).await {
                     log::error!("Error writing message: {}", e);
                     break;
                 }
@@ -257,7 +257,7 @@ impl IpcClient {
 
     /// Close the connection
     pub async fn close(&mut self) -> Result<()> {
-        if let Some(stream) = self.stream.take() {
+        if let Some(mut stream) = self.stream.take() {
             // Close the stream gracefully
             stream.shutdown().await
                 .map_err(|e| FrostWalletError::IpcError(format!("Failed to close connection: {}", e)))?;
@@ -273,7 +273,7 @@ async fn handle_connection(
     clients: Arc<Mutex<HashMap<Identifier, Sender<IpcMessage>>>>,
     incoming_tx: Sender<(Identifier, IpcMessage)>,
 ) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = stream.into_split();
 
     // Create a channel for messages to send to this client
     let (client_tx, mut client_rx) = channel::<IpcMessage>(100);
@@ -335,7 +335,7 @@ async fn handle_connection(
     // Spawn task to write outgoing messages
     tokio::spawn(async move {
         while let Some(message) = client_rx.recv().await {
-            if let Err(e) = write_message(write_half, &message).await {
+            if let Err(e) = write_message(&mut write_half, &message).await {
                 log::error!("Error writing message to client {}: {}", client_id, e);
                 break;
             }
@@ -414,7 +414,7 @@ async fn read_messages_with_sender<R: AsyncRead + Unpin>(
 
 // Helper function to write a message to a stream
 async fn write_message<W: AsyncWrite + Unpin, T: serde::Serialize>(
-    mut stream: W,
+    stream: &mut W,
     message: &T,
 ) -> Result<()> {
     let data = bincode::serialize(message)
