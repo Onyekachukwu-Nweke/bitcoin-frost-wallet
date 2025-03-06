@@ -3,17 +3,17 @@ pub mod common_capnp {
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));
 }
 
-pub mod dkg_capnp {
-    include!(concat!(env!("OUT_DIR"), "/dkg_capnp.rs"));
-}
-
-pub mod frost_capnp {
-    include!(concat!(env!("OUT_DIR"), "/frost_capnp.rs"));
-}
-
-pub mod wallet_capnp {
-    include!(concat!(env!("OUT_DIR"), "/wallet_capnp.rs"));
-}
+// pub mod dkg_capnp {
+//     include!(concat!(env!("OUT_DIR"), "/dkg_capnp.rs"));
+// }
+//
+// pub mod frost_capnp {
+//     include!(concat!(env!("OUT_DIR"), "/frost_capnp.rs"));
+// }
+//
+// pub mod wallet_capnp {
+//     include!(concat!(env!("OUT_DIR"), "/wallet_capnp.rs"));
+// }
 
 // Utility functions for working with Cap'n Proto
 

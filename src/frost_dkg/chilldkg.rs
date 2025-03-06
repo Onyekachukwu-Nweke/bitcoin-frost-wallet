@@ -1,12 +1,12 @@
 #![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
-use crate::common::types::{DkgMessage, ThresholdConfig, Participant};
+use crate::common::types::{Participant, ThresholdConfig};
 use frost_secp256k1::{
+    keys::{dkg::{part1, part2, part3, round1, round2}, KeyPackage, PublicKeyPackage},
     Identifier,
-    keys::{KeyPackage, PublicKeyPackage, SecretShare, dkg::{self, round1, round2, part1, part2, part3}},
 };
 use rand_core::OsRng;
-use std::collections::{BTreeMap};
+use std::collections::BTreeMap;
 
 /// State for a ChillDKG round
 #[derive(Debug, Clone)]
