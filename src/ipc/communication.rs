@@ -496,6 +496,9 @@ mod tests {
             server.receive()
         ).await.unwrap().unwrap();
 
+        println!("Sender ID: {:?}", sender_id);
+        println!("Received message: {:?}", received_message);
+
         // Verify the message
         assert_eq!(sender_id, client_id);
         match received_message {
