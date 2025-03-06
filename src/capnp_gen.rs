@@ -22,10 +22,9 @@ use frost_secp256k1::Identifier;
 
 use crate::common::errors::{FrostWalletError, Result};
 pub use common_capnp::*;
-// Re-export other modules as needed
-// pub use dkg_capnp::*;
-// pub use frost_capnp::*;
-// pub use wallet_capnp::*;
+pub use dkg_capnp::*;
+pub use frost_capnp::*;
+pub use wallet_capnp::*;
 
 // Convert a rust Identifier to a Cap'n Proto Identifier
 pub fn to_capnp_identifier(builder: &mut Builder<HeapAllocator>, id: Identifier) -> identifier::Builder {
