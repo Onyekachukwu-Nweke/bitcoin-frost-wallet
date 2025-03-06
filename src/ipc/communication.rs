@@ -1,6 +1,7 @@
+#![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{DkgMessage, IpcMessage, SigningMessage};
-use crate::ipc::capnp_gen::{serialize_message, deserialize_message};
+use crate::capnp_gen::{serialize_message, deserialize_message};
 use frost_secp256k1::Identifier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -145,7 +146,7 @@ impl IpcServer {
 
         for (id, tx) in clients.iter() {
             if let Err(e) = tx.send(message.clone()).await {
-                log::error!("Failed to send to participant {}: {}", id, e);
+                log::error!("Failed to send to participant {:?}: {}", id, e);
             }
         }
 
@@ -209,9 +210,9 @@ impl IpcClient {
             .await
             .map_err(|e| FrostWalletError::IpcError(format!("Failed to connect to socket: {}", e)))?;
 
-        self.stream = Some(stream);
+        // self.stream = Option::from(stream);
 
-        let (read_half, mut write_half) = self.stream.as_ref().unwrap().split();
+        let (read_half, mut write_half) = stream.into_split();
 
         let (outgoing_tx, mut outgoing_rx) = channel::<IpcMessage>(100);
         let (incoming_tx, incoming_rx) = channel::<IpcMessage>(100);
@@ -307,7 +308,7 @@ async fn handle_connection(
         _ => return Err(FrostWalletError::IpcError("Expected handshake message".to_string())),
     };
 
-    log::info!("Client {} connected", client_id);
+    log::info!("Client {:?} connected", client_id);
 
     // Add client to the map
     {
@@ -323,20 +324,20 @@ async fn handle_connection(
     let incoming_tx = incoming_tx.clone();
     tokio::spawn(async move {
         if let Err(e) = read_messages_with_sender(read_half, incoming_tx, client_id).await {
-            log::error!("Error reading messages from client {}: {}", client_id, e);
+            log::error!("Error reading messages from client {:?}: {}", client_id, e);
         }
 
         // Remove client when done
         let mut clients = clients.lock().unwrap();
         clients.remove(&client_id);
-        log::info!("Client {} disconnected", client_id);
+        log::info!("Client {:?} disconnected", client_id);
     });
 
     // Spawn task to write outgoing messages
     tokio::spawn(async move {
         while let Some(message) = client_rx.recv().await {
             if let Err(e) = write_message(&mut write_half, &message).await {
-                log::error!("Error writing message to client {}: {}", client_id, e);
+                log::error!("Error writing message to client {:?}: {}", client_id, e);
                 break;
             }
         }

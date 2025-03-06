@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{Participant, ProcessState};
 use frost_secp256k1::Identifier;
