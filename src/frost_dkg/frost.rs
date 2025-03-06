@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{Participant, ThresholdConfig};
 use frost_secp256k1::{
@@ -6,7 +7,7 @@ use frost_secp256k1::{
     round1::{SigningCommitments, SigningNonces},
     round2::SignatureShare,
 };
-use rand_core::OsRng;
+use rand_core::{OsRng};
 use std::collections::{BTreeMap, HashMap};
 
 /// FROST signing coordinator for threshold signing
