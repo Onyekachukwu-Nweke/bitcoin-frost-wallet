@@ -486,11 +486,26 @@ mod tests {
         let mut client = IpcClient::new(client_id, server_id);
         client.connect(&socket_path).await.unwrap();
 
-        // Send a test message from client to server
+        // First, receive the handshake message that is automatically sent when connecting
+        let (handshake_sender_id, handshake_message) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.receive()
+        ).await.unwrap().unwrap();
+
+        // Verify it's a handshake with the correct ID
+        assert_eq!(handshake_sender_id, client_id);
+        match handshake_message {
+            IpcMessage::Handshake(id) => {
+                assert_eq!(id, client_id);
+            },
+            _ => panic!("Expected handshake message"),
+        }
+
+        // Now send the test message
         let test_message = IpcMessage::Dkg(DkgMessage::Start(ThresholdConfig::new(2, 3)));
         client.send(test_message.clone()).await.unwrap();
 
-        // Receive the message on the server
+        // Receive the test message
         let (sender_id, received_message) = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             server.receive()
