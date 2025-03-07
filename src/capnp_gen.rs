@@ -1,3 +1,4 @@
+#![allow(warnings)]
 // Include the generated Cap'n Proto code
 pub mod common_capnp {
     include!(concat!(env!("OUT_DIR"), "/common_capnp.rs"));

@@ -1,10 +1,10 @@
+#![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{DkgMessage, IpcMessage, Participant, ProcessState, ThresholdConfig};
 use crate::frost_dkg::chilldkg::{DkgCoordinator, DkgRoundState};
 use crate::ipc::{IpcServer, IpcClient, ParticipantProcess, ProcessCoordinator};
-use frost_secp256k1::keys::{Identifier, KeyPackage, PublicKeyPackage};
+use frost_secp256k1::{Identifier, keys::{KeyPackage, PublicKeyPackage}};
 use std::collections::HashMap;
-// use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
@@ -172,8 +172,15 @@ impl DkgProcessController {
             )),
         }
 
+        // Get a copy of participant IDs before borrowing self.coordinator as mutable
+        let participant_ids: Vec<Identifier> = self.coordinator
+            .get_participants()
+            .keys()
+            .cloned()
+            .collect();
+
         // Generate and send key shares to each participant
-        for &participant_id in self.coordinator.get_participants().keys() {
+        for &participant_id in &participant_ids {
             if participant_id != self.local_id {
                 // Generate key share for this participant
                 let round2_package = self.coordinator.generate_round2(self.local_id)?;
@@ -331,7 +338,7 @@ impl DkgProcessController {
         // Send to all IPC clients
         for (id, client) in &self.ipc_clients {
             if let Err(e) = client.send(message.clone()).await {
-                log::error!("Failed to send to participant {}: {}", id, e);
+                log::error!("Failed to send to participant {:?}: {}", id, e);
             }
         }
 
@@ -400,104 +407,564 @@ impl DkgParticipantProcess {
         let local_participant = Participant::new(self.local_id);
         self.coordinator.add_participant(local_participant)?;
 
-        // Run DKG rounds
-        let key_package = self.run_dkg_rounds(client).await?;
+        // Run DKG rounds - avoid a second mutable borrow of self
+        let client_mut = self.coordinator_client.as_mut()
+            .ok_or_else(|| FrostWalletError::InvalidState("Client disappeared".to_string()))?;
+
+        // Pass a mutable reference to coordinator to run_dkg_rounds
+        let key_package = run_dkg_rounds(&mut self.coordinator, self.local_id, client_mut).await?;
 
         Ok(key_package)
     }
+}
 
-    /// Run the DKG rounds
-    async fn run_dkg_rounds(&mut self, client: &mut IpcClient) -> Result<KeyPackage> {
-        // Process messages until DKG is complete
-        loop {
-            let message = client.receive().await?;
+/// Run the DKG rounds
+async fn run_dkg_rounds(
+    coordinator: &mut DkgCoordinator,
+    local_id: Identifier,
+    client: &mut IpcClient
+) -> Result<KeyPackage> {
+    // Process messages until DKG is complete
+    loop {
+        let message = client.receive().await?;
 
-            match message {
-                IpcMessage::Dkg(dkg_message) => {
-                    match dkg_message {
-                        DkgMessage::Commitment(participant_id, commitment_bytes) => {
-                            // Deserialize the commitment
-                            let round1_package = bincode::deserialize(&commitment_bytes)
-                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize commitment: {}", e)))?;
+        match message {
+            IpcMessage::Dkg(dkg_message) => {
+                match dkg_message {
+                    DkgMessage::Commitment(participant_id, commitment_bytes) => {
+                        // Deserialize the commitment
+                        let round1_package = bincode::deserialize(&commitment_bytes)
+                            .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize commitment: {}", e)))?;
 
-                            // Process the commitment
-                            self.coordinator.process_round1_package(participant_id, round1_package)?;
+                        // Process the commitment
+                        coordinator.process_round1_package(participant_id, round1_package)?;
 
-                            // If we're in Round 1, generate and send our commitment
-                            if matches!(self.coordinator.get_round_state(), DkgRoundState::Round1) {
-                                let round1_package = self.coordinator.generate_round1(self.local_id)?;
+                        // If we're in Round 1, generate and send our commitment
+                        if matches!(coordinator.get_round_state(), DkgRoundState::Round1) {
+                            let round1_package = coordinator.generate_round1(local_id)?;
 
-                                // Process our own commitment
-                                self.coordinator.process_round1_package(self.local_id, round1_package.clone())?;
+                            // Process our own commitment
+                            coordinator.process_round1_package(local_id, round1_package.clone())?;
 
-                                // Serialize and send the commitment
-                                let commitment_bytes = bincode::serialize(&round1_package)
-                                    .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize commitment: {}", e)))?;
+                            // Serialize and send the commitment
+                            let commitment_bytes = bincode::serialize(&round1_package)
+                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize commitment: {}", e)))?;
 
-                                client.send(IpcMessage::Dkg(
-                                    DkgMessage::Commitment(self.local_id, commitment_bytes)
-                                )).await?;
-                            }
-                        },
-                        DkgMessage::KeyShare(from_id, to_id, key_share_bytes) => {
-                            // Process key share if it's for us
-                            if to_id == self.local_id {
-                                // Deserialize the key share
-                                let round2_package = bincode::deserialize(&key_share_bytes)
-                                    .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize key share: {}", e)))?;
+                            client.send(IpcMessage::Dkg(
+                                DkgMessage::Commitment(local_id, commitment_bytes)
+                            )).await?;
+                        }
+                    },
+                    DkgMessage::KeyShare(from_id, to_id, key_share_bytes) => {
+                        // Process key share if it's for us
+                        if to_id == local_id {
+                            // Deserialize the key share
+                            let round2_package = bincode::deserialize(&key_share_bytes)
+                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize key share: {}", e)))?;
 
-                                self.coordinator.process_round2_package(from_id, round2_package)?;
-                            }
+                            coordinator.process_round2_package(from_id, round2_package)?;
+                        }
 
-                            // If we're in Round 2, generate and send our key shares
-                            if matches!(self.coordinator.get_round_state(), DkgRoundState::Round2) {
-                                // Generate our round 2 package
-                                let round2_package = self.coordinator.generate_round2(self.local_id)?;
+                        // If we're in Round 2, generate and send our key shares
+                        if matches!(coordinator.get_round_state(), DkgRoundState::Round2) {
+                            // Get a copy of participant IDs before mutable borrowing
+                            let participant_ids: Vec<Identifier> = coordinator
+                                .get_participants()
+                                .keys()
+                                .cloned()
+                                .collect();
 
-                                // Serialize the package
-                                let key_share_bytes = bincode::serialize(&round2_package)
-                                    .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize key share: {}", e)))?;
+                            // Generate our round 2 package
+                            let round2_package = coordinator.generate_round2(local_id)?;
 
-                                // Send to all participants
-                                for &participant_id in self.coordinator.get_participants().keys() {
-                                    if participant_id != self.local_id {
-                                        client.send(IpcMessage::Dkg(
-                                            DkgMessage::KeyShare(self.local_id, participant_id, key_share_bytes.clone())
-                                        )).await?;
-                                    }
+                            // Serialize the package
+                            let key_share_bytes = bincode::serialize(&round2_package)
+                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize key share: {}", e)))?;
+
+                            // Send to all participants
+                            for &participant_id in &participant_ids {
+                                if participant_id != local_id {
+                                    client.send(IpcMessage::Dkg(
+                                        DkgMessage::KeyShare(local_id, participant_id, key_share_bytes.clone())
+                                    )).await?;
                                 }
                             }
-                        },
-                        DkgMessage::Finish => {
-                            // Finalize DKG
-                            if matches!(self.coordinator.get_round_state(), DkgRoundState::Round3) {
-                                let key_package = self.coordinator.finalize(self.local_id)?;
-                                return Ok(key_package);
-                            }
-                        },
-                        _ => {}
-                    }
-                },
-                _ => {}
-            }
-
-            // Check if we've advanced to Round 3
-            if matches!(self.coordinator.get_round_state(), DkgRoundState::Round3) {
-                // Send Finish message
-                client.send(IpcMessage::Dkg(DkgMessage::Finish)).await?;
-
-                // Wait for Finish message from coordinator
-                loop {
-                    let message = client.receive().await?;
-                    if let IpcMessage::Dkg(DkgMessage::Finish) = message {
-                        break;
-                    }
+                        }
+                    },
+                    DkgMessage::Finish => {
+                        // Finalize DKG
+                        if matches!(coordinator.get_round_state(), DkgRoundState::Round3) {
+                            let key_package = coordinator.finalize(local_id)?;
+                            return Ok(key_package);
+                        }
+                    },
+                    _ => {}
                 }
-
-                // Finalize and return key package
-                let key_package = self.coordinator.finalize(self.local_id)?;
-                return Ok(key_package);
-            }
+            },
+            _ => {}
         }
+
+        // Check if we've advanced to Round 3
+        if matches!(coordinator.get_round_state(), DkgRoundState::Round3) {
+            // Send Finish message
+            client.send(IpcMessage::Dkg(DkgMessage::Finish)).await?;
+
+            // Wait for Finish message from coordinator
+            loop {
+                let message = client.receive().await?;
+                if let IpcMessage::Dkg(DkgMessage::Finish) = message {
+                    break;
+                }
+            }
+
+            // Finalize and return key package
+            let key_package = coordinator.finalize(local_id)?;
+            return Ok(key_package);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+    use frost_secp256k1::Identifier;
+    use crate::common::types::ThresholdConfig;
+
+    // Helper function to create test participant IDs
+    fn create_test_ids(count: u16) -> Vec<Identifier> {
+        (1..=count).map(|id| Identifier::try_from(id).unwrap()).collect()
+    }
+
+    // Helper function to set up a basic test environment
+    async fn setup_test_environment(participant_count: u16) -> (Vec<Identifier>, Vec<PathBuf>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let ids = create_test_ids(participant_count);
+
+        // Create socket paths for each participant
+        let socket_paths: Vec<PathBuf> = ids
+            .iter()
+            .map(|id| dir.path().join(format!("participant_{}.sock", id)))
+            .collect();
+
+        (ids, socket_paths, dir)
+    }
+
+    #[tokio::test]
+    async fn test_successful_dkg_with_two_participants() {
+        // Set up basic test environment with 2 participants
+        let (ids, socket_paths, _dir) = setup_test_environment(2).await;
+        let config = ThresholdConfig::new(2, 2);
+
+        // Create coordinator and participant controllers
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant_id = ids[1];
+
+        let coordinator_socket = &socket_paths[0];
+        let participant_socket = &socket_paths[1];
+
+        // Start coordinator in a separate task
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                config.clone(),
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+            let key_package = coordinator.run_dkg().await.unwrap();
+
+            key_package
+        });
+
+        // Give coordinator time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant
+        let mut participant = DkgParticipantProcess::new(participant_id);
+        participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+        // Run participant process
+        let participant_handle = tokio::spawn(async move {
+            let key_package = participant.run().await.unwrap();
+            key_package
+        });
+
+        // Wait for both processes to complete
+        let coordinator_key_package = coordinator_handle.await.unwrap();
+        let participant_key_package = participant_handle.await.unwrap();
+
+        // Verify both key packages generate the same public key
+        assert_eq!(
+            coordinator_key_package.verifying_key(),
+            participant_key_package.verifying_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_dkg_with_three_participants() {
+        // Set up basic test environment with 3 participants
+        let (ids, socket_paths, _dir) = setup_test_environment(3).await;
+        let config = ThresholdConfig::new(2, 3);
+
+        // Create coordinator and participant controllers
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant1_id = ids[1];
+        let participant2_id = ids[2];
+
+        let coordinator_socket = &socket_paths[0];
+
+        // Shared state to collect results
+        let key_packages = Arc::new(Mutex::new(Vec::new()));
+
+        // Start coordinator in a separate task
+        let coordinator_kp = key_packages.clone();
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                config.clone(),
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+            let key_package = coordinator.run_dkg().await.unwrap();
+
+            coordinator_kp.lock().await.push((coordinator_id, key_package));
+        });
+
+        // Give coordinator time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant 1
+        let p1_kp = key_packages.clone();
+        let p1_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant1_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            let key_package = participant.run().await.unwrap();
+            p1_kp.lock().await.push((participant1_id, key_package));
+        });
+
+        // Start participant 2
+        let p2_kp = key_packages.clone();
+        let p2_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant2_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            let key_package = participant.run().await.unwrap();
+            p2_kp.lock().await.push((participant2_id, key_package));
+        });
+
+        // Wait for all processes to complete
+        coordinator_handle.await.unwrap();
+        p1_handle.await.unwrap();
+        p2_handle.await.unwrap();
+
+        // Collect all key packages
+        let collected_kps = key_packages.lock().await;
+
+        // Verify we have 3 key packages (one for each participant)
+        assert_eq!(collected_kps.len(), 3);
+
+        // Verify all key packages have the same public key
+        let reference_key = collected_kps[0].1.verifying_key();
+        for (_id, kp) in collected_kps.iter() {
+            assert_eq!(kp.verifying_key(), reference_key);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dkg_with_participant_joining_late() {
+        // Set up basic test environment with 3 participants
+        let (ids, socket_paths, _dir) = setup_test_environment(3).await;
+        let config = ThresholdConfig::new(2, 3);
+
+        // Create coordinator and participant controllers
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant1_id = ids[1];
+        let participant2_id = ids[2];
+
+        let coordinator_socket = &socket_paths[0];
+
+        // Start coordinator with delayed DKG
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                config.clone(),
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+
+            // Wait before starting DKG
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let key_package = coordinator.run_dkg().await.unwrap();
+            key_package
+        });
+
+        // Give coordinator time to start up server
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant 1 immediately
+        let p1_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant1_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            let key_package = participant.run().await.unwrap();
+            key_package
+        });
+
+        // Start participant 2 with a delay (joining "late")
+        let p2_handle = tokio::spawn(async move {
+            // Delay before connecting
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let mut participant = DkgParticipantProcess::new(participant2_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            let key_package = participant.run().await.unwrap();
+            key_package
+        });
+
+        // Wait for all processes to complete
+        let coordinator_key_package = coordinator_handle.await.unwrap();
+        let p1_key_package = p1_handle.await.unwrap();
+        let p2_key_package = p2_handle.await.unwrap();
+
+        // Verify all key packages have the same public key
+        let coordinator_pk = coordinator_key_package.verifying_key();
+        assert_eq!(p1_key_package.verifying_key(), coordinator_pk);
+        assert_eq!(p2_key_package.verifying_key(), coordinator_pk);
+    }
+
+    #[tokio::test]
+    async fn test_dkg_with_disconnecting_participant() {
+        // Set up basic test environment with 3 participants
+        let (ids, socket_paths, _dir) = setup_test_environment(3).await;
+        let config = ThresholdConfig::new(2, 3); // 2-of-3 threshold
+
+        // Create coordinator and participant controllers
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant1_id = ids[1];
+        let participant2_id = ids[2];
+
+        let coordinator_socket = &socket_paths[0];
+
+        // Start coordinator
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                config.clone(),
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+
+            // This should still complete even with one participant disconnecting
+            // since we only need 2 out of 3 participants
+            let key_package = coordinator.run_dkg().await.unwrap();
+            key_package
+        });
+
+        // Give coordinator time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant 1 (which will complete the process)
+        let p1_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant1_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            let key_package = participant.run().await.unwrap();
+            key_package
+        });
+
+        // Start participant 2 (which will disconnect)
+        let p2_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant2_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            // Send handshake but then "disconnect" by exiting
+            participant.coordinator_client.as_mut().unwrap()
+                .send(IpcMessage::Handshake(participant2_id)).await.unwrap();
+
+            // Exit without completing DKG
+            Option::<KeyPackage>::None
+        });
+
+        // Wait for p2 to exit
+        let _ = p2_handle.await.unwrap();
+
+        // Wait for coordinator and p1 to complete
+        let coordinator_key_package = coordinator_handle.await.unwrap();
+        let p1_key_package = p1_handle.await.unwrap();
+
+        // Verify both have the same public key
+        assert_eq!(
+            coordinator_key_package.verifying_key(),
+            p1_key_package.verifying_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dkg_with_insufficient_participants() {
+        // Set up basic test environment with 3 participants
+        let (ids, socket_paths, _dir) = setup_test_environment(3).await;
+
+        // Create a 3-of-3 threshold - all participants required
+        let config = ThresholdConfig::new(3, 3);
+
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant1_id = ids[1];
+        // We won't use participant2_id at all
+
+        let coordinator_socket = &socket_paths[0];
+
+        // Start coordinator with timeout
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                config.clone(),
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+
+            // This should timeout since we need 3 participants but only have 2
+            let result = tokio::time::timeout(
+                Duration::from_secs(5), // Shorter timeout for test
+                coordinator.run_dkg()
+            ).await;
+
+            result
+        });
+
+        // Give coordinator time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant 1 (the only other participant)
+        let p1_handle = tokio::spawn(async move {
+            let mut participant = DkgParticipantProcess::new(participant1_id);
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            // This should also eventually timeout or error
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                participant.run()
+            ).await;
+
+            result
+        });
+
+        // Wait for processes to complete or timeout
+        let coordinator_result = coordinator_handle.await.unwrap();
+        let p1_result = p1_handle.await.unwrap();
+
+        // Verify both timed out or encountered errors
+        assert!(coordinator_result.is_err() || coordinator_result.unwrap().is_err());
+        assert!(p1_result.is_err() || p1_result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dkg_with_config_mismatch() {
+        // Set up basic test environment
+        let (ids, socket_paths, _dir) = setup_test_environment(2).await;
+
+        // Create different configs for coordinator and participant
+        let coordinator_config = ThresholdConfig::new(2, 3);
+        let participant_config = ThresholdConfig::new(2, 4); // Different!
+
+        let binary_path = std::env::current_exe().unwrap();
+
+        let coordinator_id = ids[0];
+        let participant_id = ids[1];
+
+        let coordinator_socket = &socket_paths[0];
+
+        // Start coordinator
+        let coordinator_handle = tokio::spawn(async move {
+            let mut coordinator = DkgProcessController::new(
+                coordinator_id,
+                coordinator_config,
+                binary_path,
+            );
+
+            coordinator.start_server(coordinator_socket).await.unwrap();
+            let key_package = coordinator.run_dkg().await;
+            key_package
+        });
+
+        // Give coordinator time to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create a custom participant with a different config
+        let p1_handle = tokio::spawn(async move {
+            // Create participant with different config
+            let mut participant = DkgParticipantProcess::new(participant_id);
+
+            // Override with mismatched config
+            participant.coordinator = DkgCoordinator::new(participant_config);
+
+            participant.connect_to_coordinator(coordinator_socket).await.unwrap();
+
+            // This should fail due to config mismatch
+            let key_package = participant.run().await;
+            key_package
+        });
+
+        // Wait for processes to complete
+        let coordinator_result = coordinator_handle.await.unwrap();
+        let p1_result = p1_handle.await.unwrap();
+
+        // At least one should fail with an error
+        assert!(coordinator_result.is_err() || p1_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_participant_process() {
+        // Set up basic test environment
+        let (ids, _socket_paths, _dir) = setup_test_environment(2).await;
+        let config = ThresholdConfig::new(2, 2);
+
+        let coordinator_id = ids[0];
+        let participant_id = ids[1];
+
+        // Get path to current executable for test
+        let binary_path = std::env::current_exe().unwrap();
+
+        // Create controller
+        let mut controller = DkgProcessController::new(
+            coordinator_id,
+            config,
+            binary_path.clone(),
+        );
+
+        // Test spawning a participant
+        let args = vec![
+            "--id".to_string(),
+            participant_id.to_string(),
+            "participant".to_string(),
+        ];
+
+        // This might not actually work in tests, but we can verify the API works
+        let result = controller.spawn_participant(participant_id, args).await;
+
+        // Just check that the function completes without error
+        assert!(result.is_ok());
+
+        // Verify the process was added to the coordinator
+        assert!(controller.processes.get_process(participant_id).is_some());
     }
 }
