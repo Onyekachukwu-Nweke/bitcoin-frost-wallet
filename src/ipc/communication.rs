@@ -10,7 +10,8 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::fs;
 
 /// Maximum message size in bytes (10MB)
@@ -129,7 +130,7 @@ impl IpcServer {
 
     /// Send a message to a specific participant
     pub async fn send(&self, participant_id: Identifier, message: IpcMessage) -> Result<()> {
-        let clients = self.clients.lock().unwrap();
+        let clients = self.clients.lock().await;
 
         if let Some(tx) = clients.get(&participant_id) {
             tx.send(message).await
@@ -142,7 +143,7 @@ impl IpcServer {
 
     /// Broadcast a message to all participants
     pub async fn broadcast(&self, message: IpcMessage) -> Result<()> {
-        let clients = self.clients.lock().unwrap();
+        let clients = self.clients.lock().await;
 
         for (id, tx) in clients.iter() {
             if let Err(e) = tx.send(message.clone()).await {
@@ -312,7 +313,7 @@ async fn handle_connection(
 
     // Add client to the map
     {
-        let mut clients = clients.lock().unwrap();
+        let mut clients = clients.lock().await;
         clients.insert(client_id, client_tx.clone());
     }
 
@@ -328,7 +329,7 @@ async fn handle_connection(
         }
 
         // Remove client when done
-        let mut clients = clients.lock().unwrap();
+        let mut clients = clients.lock().await;
         clients.remove(&client_id);
         log::info!("Client {:?} disconnected", client_id);
     });
