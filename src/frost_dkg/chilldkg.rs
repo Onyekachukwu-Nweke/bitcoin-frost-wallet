@@ -91,6 +91,11 @@ impl DkgCoordinator {
         &self.round_state
     }
 
+    /// Get the threshold configuration
+    pub fn get_config(&self) -> &ThresholdConfig {
+        &self.config
+    }
+
     /// Start the DKG process
     pub fn start(&mut self) -> Result<()> {
         // Verify we have enough participants
@@ -356,72 +361,72 @@ impl DkgCoordinator {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use frost_secp256k1::Identifier;
-//
-//     #[test]
-//     fn test_dkg_coordinator() {
-//         // Create a 2-of-3 threshold configuration
-//         let config = ThresholdConfig::new(2, 3);
-//
-//         // Create coordinator
-//         let mut coordinator = DkgCoordinator::new(config);
-//
-//         // Add participants
-//         for i in 1..=3 {
-//             let participant = Participant::new(Identifier::try_from(i as u16).unwrap());
-//             coordinator.add_participant(participant).unwrap();
-//         }
-//
-//         // Start DKG
-//         coordinator.start().unwrap();
-//
-//         // Verify initial state
-//         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
-//
-//         // Generate and process round 1 packages
-//         for i in 1..=3 {
-//             let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
-//             let package = coordinator.generate_round1(id).unwrap();
-//             coordinator.process_round1_package(id, package).unwrap();
-//         }
-//
-//         // Verify state advanced to Round 2
-//         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round2));
-//
-//         // Generate and process round 2 packages
-//         for i in 1..=3 {
-//             let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
-//             let package = coordinator.generate_round2(id).unwrap();
-//             coordinator.process_round2_package(id, package).unwrap();
-//         }
-//
-//         println!("{:?}", coordinator.get_round_state());
-//
-//         // Verify state advanced to Round 3
-//         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round3));
-//
-//         // Finalize DKG for each participant
-//         for i in 1..=3 {
-//             let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
-//             coordinator.finalize(id).unwrap();
-//         }
-//
-//         // Verify state is Complete
-//         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
-//
-//         // Get the public key package
-//         let pub_key_package = coordinator.get_public_key_package().unwrap();
-//
-//         // Verify key packages are available
-//         for i in 1..=3 {
-//             let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
-//             let key_package = coordinator.get_key_package(id).unwrap();
-//             assert_eq!(key_package.verifying_key(), pub_key_package.verifying_key());
-//         }
-//     }
-// }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frost_secp256k1::Identifier;
+
+    #[test]
+    fn test_dkg_coordinator() {
+        // Create a 2-of-3 threshold configuration
+        let config = ThresholdConfig::new(2, 3);
+
+        // Create coordinator
+        let mut coordinator = DkgCoordinator::new(config);
+
+        // Add participants
+        for i in 1..=3 {
+            let participant = Participant::new(Identifier::try_from(i as u16).unwrap());
+            coordinator.add_participant(participant).unwrap();
+        }
+
+        // Start DKG
+        coordinator.start().unwrap();
+
+        // Verify initial state
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
+
+        // Generate and process round 1 packages
+        for i in 1..=3 {
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let package = coordinator.generate_round1(id).unwrap();
+            coordinator.process_round1_package(id, package).unwrap();
+        }
+
+        // Verify state advanced to Round 2
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round2));
+
+        // Generate and process round 2 packages
+        for i in 1..=3 {
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let package = coordinator.generate_round2(id).unwrap();
+            coordinator.process_round2_package(id, package).unwrap();
+        }
+
+        println!("{:?}", coordinator.get_round_state());
+
+        // Verify state advanced to Round 3
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round3));
+
+        // Finalize DKG for each participant
+        for i in 1..=3 {
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            coordinator.finalize(id).unwrap();
+        }
+
+        // Verify state is Complete
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
+
+        // Get the public key package
+        let pub_key_package = coordinator.get_public_key_package().unwrap();
+
+        // Verify key packages are available
+        for i in 1..=3 {
+            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let key_package = coordinator.get_key_package(id).unwrap();
+            assert_eq!(key_package.verifying_key(), pub_key_package.verifying_key());
+        }
+    }
+}
 
 
