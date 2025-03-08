@@ -1,7 +1,7 @@
 #![allow(warnings)]
 use bitcoin::{Address, Network, Transaction};
-use frost_core::{Identifier, Scalar};
 use frost_secp256k1::{
+    Identifier,
     keys::{KeyPackage, PublicKeyPackage, SecretShare, SigningShare},
     Signature
 };
@@ -34,7 +34,7 @@ impl ThresholdConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Participant {
     /// Unique participant identifier
-    pub id: Identifier<frost_secp256k1::Secp256K1Sha256>,
+    pub id: Identifier,
     /// Key material (None if this is a remote participant)
     pub key_package: Option<KeyPackage>,
     /// Process ID if running in a separate process
@@ -42,7 +42,7 @@ pub struct Participant {
 }
 
 impl Participant {
-    pub fn new(id: Identifier<frost_secp256k1::Secp256K1Sha256>) -> Self {
+    pub fn new(id: Identifier) -> Self {
         Self {
             id,
             key_package: None,
@@ -50,7 +50,7 @@ impl Participant {
         }
     }
 
-    pub fn with_key_package(id: Identifier<frost_secp256k1::Secp256K1Sha256>, key_package: KeyPackage) -> Self {
+    pub fn with_key_package(id: Identifier, key_package: KeyPackage) -> Self {
         Self {
             id,
             key_package: Some(key_package),
@@ -70,7 +70,7 @@ pub enum IpcMessage {
     Dkg(DkgMessage),
     /// Signing-related messages
     Signing(SigningMessage),
-    Handshake(Identifier<frost_secp256k1::Secp256K1Sha256>),
+    Handshake(Identifier),
     /// Error message
     Error(String),
     /// Success message with optional data
@@ -83,9 +83,9 @@ pub enum DkgMessage {
     /// Start a new DKG round
     Start(ThresholdConfig),
     /// Share a commitment with all participants
-    Commitment(Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>),
+    Commitment(Identifier, Vec<u8>),
     /// Share a key with a specific participant
-    KeyShare(Identifier<frost_secp256k1::Secp256K1Sha256>, Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>),
+    KeyShare(Identifier, Identifier, Vec<u8>),
     /// Finish the DKG process
     Finish,
 }
@@ -98,26 +98,26 @@ pub enum SigningMessage {
         /// The message to sign
         message: Vec<u8>,
         /// Participants involved in signing
-        signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>>,
+        signers: Vec<Identifier>,
     },
     /// Nonce/commitment for round 1
     Round1 {
         /// Participant ID
-        id: Identifier<frost_secp256k1::Secp256K1Sha256>,
+        id: Identifier,
         /// Commitment data
         commitment: Vec<u8>,
     },
     /// Signature share for round 2
     Round2 {
         /// Participant ID
-        id: Identifier<frost_secp256k1::Secp256K1Sha256>,
+        id: Identifier,
         /// Signature share data
         signature_share: Vec<u8>,
     },
     /// Finalize signing by aggregating signature shares
     Finalize {
         /// All signature shares to aggregate
-        shares: Vec<(Identifier<frost_secp256k1::Secp256K1Sha256>, Vec<u8>)>,
+        shares: Vec<(Identifier, Vec<u8>)>,
     },
 }
 
@@ -185,7 +185,7 @@ pub struct SigningRequest {
     /// Input value in satoshis
     pub input_value: u64,
     /// Participants that will sign
-    pub signers: Vec<Identifier<frost_secp256k1::Secp256K1Sha256>>,
+    pub signers: Vec<Identifier>,
 }
 
 /// Transaction signing result
