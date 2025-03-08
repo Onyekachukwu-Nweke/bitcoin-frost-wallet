@@ -34,7 +34,7 @@ pub struct DkgCoordinator {
     /// Round 1 packages received from participants
     round1_packages: BTreeMap<Identifier, round1::Package>,
     /// Round 2 packages received from participants
-    round2_packages: BTreeMap<Identifier, round2::Package>,
+    round2_packages: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>>,
     /// Final key packages after DKG
     key_packages: Option<BTreeMap<Identifier, KeyPackage>>,
     /// Final public key package
@@ -185,9 +185,8 @@ impl DkgCoordinator {
         Ok(())
     }
 
-    /// Generate round 2 package for the specified participant
-    pub fn generate_round2(&mut self, participant_id: Identifier) -> Result<round2::Package> {
-        // Verify we're in the right round
+    /// Generate round 2 packages for the specified participant
+    pub fn generate_round2(&mut self, participant_id: Identifier) -> Result<BTreeMap<Identifier, round2::Package>> {
         match self.round_state {
             DkgRoundState::Round2 => {},
             _ => return Err(FrostWalletError::DkgError(format!(
@@ -196,16 +195,13 @@ impl DkgCoordinator {
             ))),
         }
 
-        // Verify the participant exists
         if !self.participants.contains_key(&participant_id) {
             return Err(FrostWalletError::ParticipantNotFound(participant_id));
         }
 
-        // Get the local round 1 secret
-        let round1_secret = self.local_round1_secret.remove(&participant_id).unwrap();
-            // .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?.clone();
+        let round1_secret = self.local_round1_secret.remove(&participant_id)
+            .ok_or_else(|| FrostWalletError::DkgError("No local round 1 secret".to_string()))?;
 
-        // Ensure we have the right number of round1 packages
         if self.round1_packages.len() != self.participants.len() {
             return Err(FrostWalletError::DkgError(format!(
                 "Not enough round 1 packages: have {}, need {}",
@@ -216,11 +212,10 @@ impl DkgCoordinator {
 
         let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages
             .iter()
-            .filter(|(id, _)| **id != participant_id)  // Only include other participants' packages
+            .filter(|(id, _)| **id != participant_id)
             .map(|(id, pkg)| (*id, pkg.clone()))
             .collect();
 
-        // Generate Round 2 data
         let (round2_secret, round2_packages) = part2(
             round1_secret,
             &round1_packages,
@@ -228,27 +223,11 @@ impl DkgCoordinator {
 
         self.local_round2_secret.insert(participant_id, round2_secret);
 
-        // Store the package
-        // self.round2_packages = round2_packages.clone();
-
-        // let round2_package = round2_packages.get(&participant_id).unwrap().clone();
-        //
-        // Ok(round2_package)
-        if let Some((_, first_package)) = round2_packages.iter().next() {
-            let dummy_package = first_package.clone();
-
-            // Add this to our round2_packages so the test will advance to round3
-            self.round2_packages.insert(participant_id, dummy_package.clone());
-
-            Ok(dummy_package)
-        } else {
-            Err(FrostWalletError::DkgError("No round 2 packages generated".to_string()))
-        }
+        Ok(round2_packages)
     }
 
-    // Process a round 2 package from a participant
-    pub fn process_round2_package(&mut self, participant_id: Identifier, package: round2::Package) -> Result<()> {
-        // Verify we're in the right round
+    /// Process round 2 packages from a participant
+    pub fn process_round2_package(&mut self, participant_id: Identifier, packages: BTreeMap<Identifier, round2::Package>) -> Result<()> {
         match self.round_state {
             DkgRoundState::Round2 => {},
             _ => return Err(FrostWalletError::DkgError(format!(
@@ -257,19 +236,13 @@ impl DkgCoordinator {
             ))),
         }
 
-        // Verify the participant exists
         if !self.participants.contains_key(&participant_id) {
             return Err(FrostWalletError::ParticipantNotFound(participant_id));
         }
 
-        // // Store the package
-        self.round2_packages.insert(participant_id, package);
+        self.round2_packages.insert(participant_id, packages);
 
-        // println!("Round2 Len: {}, Participant Len: {}", self.round2_packages.len(), self.participants.len());
-
-        // Check if we have all round 2 packages
         if self.round2_packages.len() == self.participants.len() {
-            // Advance to Round 3
             self.round_state = DkgRoundState::Round3;
         }
 
@@ -278,7 +251,6 @@ impl DkgCoordinator {
 
     /// Finalize the DKG process and create key packages
     pub fn finalize(&mut self, participant_id: Identifier) -> Result<KeyPackage> {
-        // Verify we're in the right round
         match self.round_state {
             DkgRoundState::Round3 => {},
             _ => return Err(FrostWalletError::DkgError(format!(
@@ -287,51 +259,44 @@ impl DkgCoordinator {
             ))),
         }
 
-        // Get the local round 2 secret
         let round2_secret = self.local_round2_secret.get(&participant_id)
             .ok_or_else(|| FrostWalletError::DkgError("No local round 2 secret".to_string()))?;
 
-        // Get all round 1 packages
         let round1_packages: BTreeMap<Identifier, round1::Package> = self.round1_packages
             .iter()
-            .filter(|(id, _)| **id != participant_id)  // Only include other participants' packages
+            .filter(|(id, _)| **id != participant_id)
             .map(|(id, pkg)| (*id, pkg.clone()))
             .collect();
 
-        // Get all round 2 packages
+        // Collect round2 packages intended for this participant from all other senders
         let round2_packages: BTreeMap<Identifier, round2::Package> = self.round2_packages
             .iter()
-            .filter(|(id, _)| **id != participant_id)  // Only include other participants' packages
-            .map(|(id, pkg)| (*id, pkg.clone()))
+            .filter_map(|(sender_id, packages)| {
+                if *sender_id != participant_id {
+                    packages.get(&participant_id).map(|pkg| (*sender_id, pkg.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
 
-        // Verify and finalize
         let (key_package, public_key_package) = part3(
             round2_secret,
             &round1_packages,
             &round2_packages,
         ).map_err(|e| FrostWalletError::DkgError(format!("DKG finalization error: {}", e)))?;
 
-        // Store the public key package
         if self.pub_key_package.is_none() {
             self.pub_key_package = Some(BTreeMap::new());
         }
-
-        // Add the public key package to the map
         self.pub_key_package.as_mut().unwrap().insert(participant_id, public_key_package.clone());
 
-        // self.pub_key_package = Some(public_key_package);
-
-        // Create the key packages map if it doesn't exist
         if self.key_packages.is_none() {
             self.key_packages = Some(BTreeMap::new());
         }
-
-        // Add the key package to the map
         self.key_packages.as_mut().unwrap().insert(participant_id, key_package.clone());
 
-        // Set state to Complete
-        if self.key_packages.iter().len() == self.participants.len() && self.pub_key_package.iter().len() == self.participants.len() {
+        if self.key_packages.as_ref().unwrap().len() == self.participants.len() {
             self.round_state = DkgRoundState::Complete;
         }
 
@@ -368,61 +333,43 @@ mod tests {
 
     #[test]
     fn test_dkg_coordinator() {
-        // Create a 2-of-3 threshold configuration
         let config = ThresholdConfig::new(2, 3);
-
-        // Create coordinator
         let mut coordinator = DkgCoordinator::new(config);
 
-        // Add participants
         for i in 1..=3 {
             let participant = Participant::new(Identifier::try_from(i as u16).unwrap());
             coordinator.add_participant(participant).unwrap();
         }
 
-        // Start DKG
         coordinator.start().unwrap();
-
-        // Verify initial state
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
 
-        // Generate and process round 1 packages
         for i in 1..=3 {
-            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let id = Identifier::try_from(i as u16).unwrap();
             let package = coordinator.generate_round1(id).unwrap();
             coordinator.process_round1_package(id, package).unwrap();
         }
 
-        // Verify state advanced to Round 2
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round2));
 
-        // Generate and process round 2 packages
         for i in 1..=3 {
-            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
-            let package = coordinator.generate_round2(id).unwrap();
-            coordinator.process_round2_package(id, package).unwrap();
+            let id = Identifier::try_from(i as u16).unwrap();
+            let packages = coordinator.generate_round2(id).unwrap();
+            coordinator.process_round2_package(id, packages).unwrap();
         }
 
-        println!("{:?}", coordinator.get_round_state());
-
-        // Verify state advanced to Round 3
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round3));
 
-        // Finalize DKG for each participant
         for i in 1..=3 {
-            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let id = Identifier::try_from(i as u16).unwrap();
             coordinator.finalize(id).unwrap();
         }
 
-        // Verify state is Complete
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
 
-        // Get the public key package
         let pub_key_package = coordinator.get_public_key_package().unwrap();
-
-        // Verify key packages are available
         for i in 1..=3 {
-            let id = Identifier::from(Identifier::try_from(i as u16).unwrap());
+            let id = Identifier::try_from(i as u16).unwrap();
             let key_package = coordinator.get_key_package(id).unwrap();
             assert_eq!(key_package.verifying_key(), pub_key_package.verifying_key());
         }
