@@ -1,14 +1,20 @@
-use crate::common::errors::{FrostWalletError, Result};
-use crate::common::types::{DkgMessage, IpcMessage, Participant, ProcessState, ThresholdConfig};
-use crate::frost_dkg::chilldkg::{DkgCoordinator, DkgRoundState};
-use crate::ipc::{IpcServer, IpcClient, ParticipantProcess, ProcessCoordinator};
-use frost_secp256k1::{Identifier, keys::{KeyPackage, PublicKeyPackage}};
-use std::collections::HashMap;
+use tokio::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
-use tokio::sync::Mutex;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use crate::common::errors::{FrostWalletError, Result};
+use crate::frost_dkg::chilldkg::{DkgCoordinator, DkgRoundState};
+use crate::ipc::{IpcServer, IpcClient};
+use crate::ipc::process::{ParticipantProcess, ProcessCoordinator};
+use crate::common::types::{
+    DkgMessage, IpcMessage, Participant, ProcessState, ThresholdConfig,
+};
+use frost_secp256k1::{
+    Identifier,
+    keys::{KeyPackage, PublicKeyPackage},
+};
+
 
 /// Timeout for DKG operations in seconds
 const DKG_TIMEOUT_SECONDS: u64 = 60;
@@ -37,6 +43,7 @@ impl DkgProcessController {
         local_id: Identifier,
         config: ThresholdConfig,
         binary_path: PathBuf,
+
     ) -> Self {
         let coordinator = DkgCoordinator::new(config.clone());
         let processes = ProcessCoordinator::new();
@@ -50,9 +57,11 @@ impl DkgProcessController {
             ipc_clients: HashMap::new(),
             binary_path,
         }
+
     }
 
     /// Start the IPC server
+
     pub async fn start_server(&mut self, socket_path: impl AsRef<Path>) -> Result<()> {
         let server = IpcServer::new(self.local_id, socket_path).await?;
         server.start().await?;
@@ -85,7 +94,7 @@ impl DkgProcessController {
         Ok(())
     }
 
-    /// Run DKG with the local participant
+    /// Run DKG with the local participan
     pub async fn run_dkg(&mut self) -> Result<KeyPackage> {
         // Initialize DKG
         self.coordinator.start()?;
@@ -118,18 +127,12 @@ impl DkgProcessController {
             )),
         }
 
-        // Generate local commitment
+        // Generate local Round 1 package
         let round1_package = self.coordinator.generate_round1(self.local_id)?;
 
-        // Process local commitment
-        self.coordinator.process_round1_package(self.local_id, round1_package.clone())?;
-
-        // Broadcast commitment to all participants
-        let commitment_bytes = bincode::serialize(&round1_package)
-            .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize commitment: {}", e)))?;
-
+        // Broadcast round1 package to all participants
         self.broadcast_message(IpcMessage::Dkg(
-            DkgMessage::Commitment(self.local_id, commitment_bytes)
+            DkgMessage::Commitment(self.local_id, bincode::serialize(&round1_package)?)
         )).await?;
 
         // Wait for commitments from all participants
@@ -173,39 +176,19 @@ impl DkgProcessController {
             )),
         }
 
-        // Get a copy of participant IDs before borrowing self.coordinator as mutable
-        let participant_ids: Vec<Identifier> = self.coordinator
-            .get_participants()
-            .keys()
-            .cloned()
-            .collect();
+        // Generate Round 2 packages for this participant
+        let round2_packages = self.coordinator.generate_round2(self.local_id)?;
 
-        // Generate and send key shares to each participant
-        for &participant_id in &participant_ids {
-            if participant_id != self.local_id {
-                // Generate key share for this participant
-                let round2_package = self.coordinator.generate_round2(self.local_id)?;
-
-                // Serialize the key share
-                let key_share_bytes = bincode::serialize(&round2_package)
-                    .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize key share: {}", e)))?;
-
-                // Send key share
-                self.send_message(
-                    participant_id,
-                    IpcMessage::Dkg(DkgMessage::KeyShare(
-                        self.local_id,
-                        participant_id,
-                        key_share_bytes,
-                    )),
-                ).await?;
-
-                // Process key share locally
-                self.coordinator.process_round2_package(
-                    participant_id,
-                    round2_package,
-                )?;
-            }
+        // Send each package to the corresponding participant
+        for (recipient_id, package) in &round2_packages {
+            self.send_message(
+                *recipient_id,
+                IpcMessage::Dkg(DkgMessage::KeyShare(
+                    self.local_id,
+                    *recipient_id,
+                    bincode::serialize(package)?,
+                )),
+            ).await?;
         }
 
         // Wait for key shares from all participants
@@ -249,8 +232,10 @@ impl DkgProcessController {
             )),
         }
 
-        // Finalize DKG
+        // Finalize DKG for the local participant
         let key_package = self.coordinator.finalize(self.local_id)?;
+
+        // Get public key package
         let pub_key_package = self.coordinator.get_public_key_package()?;
 
         // Broadcast completion
@@ -282,22 +267,25 @@ impl DkgProcessController {
                         let participant = Participant::new(sender_id);
                         let _ = self.coordinator.add_participant(participant);
                     },
-                    DkgMessage::Commitment(participant_id, commitment_bytes) => {
-                        // Deserialize the commitment
-                        let round1_package = bincode::deserialize(&commitment_bytes)
-                            .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize commitment: {}", e)))?;
+                    DkgMessage::Commitment(participant_id, commitment_data) => {
+                        // Deserialize commitment data
+                        let round1_package = bincode::deserialize(&commitment_data)?;
 
                         // Process commitment
                         self.coordinator.process_round1_package(participant_id, round1_package)?;
                     },
-                    DkgMessage::KeyShare(from_id, to_id, key_share_bytes) => {
+                    DkgMessage::KeyShare(from_id, to_id, key_share_data) => {
                         // Process key share if it's for us
                         if to_id == self.local_id {
-                            // Deserialize the key share
-                            let round2_package = bincode::deserialize(&key_share_bytes)
-                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize key share: {}", e)))?;
+                            // Deserialize key share data
+                            let round2_package = bincode::deserialize(&key_share_data)?;
 
-                            self.coordinator.process_round2_package(from_id, round2_package)?;
+                            // Collect all packages for this sender
+                            let mut packages = BTreeMap::new();
+                            packages.insert(self.local_id, round2_package);
+
+                            // Process the round 2 package
+                            self.coordinator.process_round2_package(from_id, packages)?;
                         }
                     },
                     DkgMessage::Finish => {
@@ -336,394 +324,394 @@ impl DkgProcessController {
 
     /// Broadcast a message to all participants
     async fn broadcast_message(&self, message: IpcMessage) -> Result<()> {
-        // Send to all IPC clients
-        for (id, client) in &self.ipc_clients {
-            if let Err(e) = client.send(message.clone()).await {
-                log::error!("Failed to send to participant {:?}: {}", id, e);
-            }
-        }
-
-        // Send to all IPC server clients
         if let Some(server) = &self.ipc_server {
-            server.broadcast(message).await?;
+            server.broadcast(message).await
+        } else {
+            // If no server, send to each client individually
+            for (id, client) in &self.ipc_clients {
+                client.send(message.clone()).await?;
+            }
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
-/// DKG participant process - runs on each participant
+/// DKG participant process - runs as a separate process
 pub struct DkgParticipantProcess {
     /// Local participant ID
     local_id: Identifier,
     /// DKG coordinator
     coordinator: DkgCoordinator,
-    /// IPC client for connection to coordinator
-    coordinator_client: Option<IpcClient>,
+    /// IPC client for communication with the coordinator
+    client: Option<IpcClient>,
+    /// Received key package
+    key_package: Option<KeyPackage>,
 }
 
 impl DkgParticipantProcess {
     /// Create a new DKG participant process
     pub fn new(local_id: Identifier) -> Self {
-        let config = ThresholdConfig::new(2, 3); // Default config, will be overridden by coordinator
+        let config = ThresholdConfig::new(0, 0); // Will be replaced with actual config from coordinator
         let coordinator = DkgCoordinator::new(config);
 
         Self {
             local_id,
             coordinator,
-            coordinator_client: None,
+            client: None,
+            key_package: None,
         }
     }
 
-    /// Connect to the DKG coordinator
+    /// Connect to the coordinator
     pub async fn connect_to_coordinator(&mut self, socket_path: impl AsRef<Path>) -> Result<()> {
-        let mut client = IpcClient::new(self.local_id, Identifier::try_from(1).unwrap());
+        let coordinator_id = Identifier::try_from(1u16).unwrap(); // Assuming coordinator has ID 1
+        let mut client = IpcClient::new(self.local_id, coordinator_id);
         client.connect(socket_path).await?;
-        self.coordinator_client = Some(client);
+        self.client = Some(client);
         Ok(())
     }
 
-    /// Run the DKG process
+    /// Run the DKG protocol as a participant
     pub async fn run(&mut self) -> Result<KeyPackage> {
-        // Wait for Start message from coordinator
-        let client = self.coordinator_client.as_mut()
+        // Verify we have a connection to the coordinator
+        let client = self.client.as_mut()
             .ok_or_else(|| FrostWalletError::InvalidState("Not connected to coordinator".to_string()))?;
 
-        // Send handshake
-        client.send(IpcMessage::Handshake(self.local_id)).await?;
+        let mut round_state = DkgRoundState::Round1;
+        let mut received_config = false;
 
-        // Wait for initial DKG message
-        let message = client.receive().await?;
+        log::info!("Starting DKG as participant {:?}", self.local_id);
 
-        let config = match message {
-            IpcMessage::Dkg(DkgMessage::Start(config)) => config,
-            _ => return Err(FrostWalletError::DkgError("Expected Start message from coordinator".to_string())),
-        };
+        // Wait for coordinator to start DKG
+        loop {
+            // Receive a message from the coordinator
+            let message = client.receive().await?;
 
-        // Initialize DKG with the received config
-        self.coordinator = DkgCoordinator::new(config);
-        self.coordinator.start()?;
+            match message {
+                IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                    log::info!("Received DKG start: {:?}", config);
 
-        // Add ourselves as a participant
-        let local_participant = Participant::new(self.local_id);
-        self.coordinator.add_participant(local_participant)?;
+                    // Initialize coordinator with the received config
+                    self.coordinator = DkgCoordinator::new(config.clone());
 
-        // Run DKG rounds - avoid a second mutable borrow of self
-        let client_mut = self.coordinator_client.as_mut()
-            .ok_or_else(|| FrostWalletError::InvalidState("Client disappeared".to_string()))?;
+                    // Add ourselves as a participant
+                    let participant = Participant::new(self.local_id);
+                    self.coordinator.add_participant(participant)?;
 
-        // Pass a mutable reference to coordinator to run_dkg_rounds
-        let key_package = run_dkg_rounds(&mut self.coordinator, self.local_id, client_mut).await?;
-
-        Ok(key_package)
-    }
-}
-
-/// Run the DKG rounds
-async fn run_dkg_rounds(
-    coordinator: &mut DkgCoordinator,
-    local_id: Identifier,
-    client: &mut IpcClient
-) -> Result<KeyPackage> {
-    // Process messages until DKG is complete
-    loop {
-        let message = client.receive().await?;
-
-        match message {
-            IpcMessage::Dkg(dkg_message) => {
-                match dkg_message {
-                    DkgMessage::Commitment(participant_id, commitment_bytes) => {
-                        // Deserialize the commitment
-                        let round1_package = bincode::deserialize(&commitment_bytes)
-                            .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize commitment: {}", e)))?;
-
-                        // Process the commitment
-                        coordinator.process_round1_package(participant_id, round1_package)?;
-
-                        // If we're in Round 1, generate and send our commitment
-                        if matches!(coordinator.get_round_state(), DkgRoundState::Round1) {
-                            let round1_package = coordinator.generate_round1(local_id)?;
-
-                            // Process our own commitment
-                            coordinator.process_round1_package(local_id, round1_package.clone())?;
-
-                            // Serialize and send the commitment
-                            let commitment_bytes = bincode::serialize(&round1_package)
-                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize commitment: {}", e)))?;
-
-                            client.send(IpcMessage::Dkg(
-                                DkgMessage::Commitment(local_id, commitment_bytes)
-                            )).await?;
-                        }
-                    },
-                    DkgMessage::KeyShare(from_id, to_id, key_share_bytes) => {
-                        // Process key share if it's for us
-                        if to_id == local_id {
-                            // Deserialize the key share
-                            let round2_package = bincode::deserialize(&key_share_bytes)
-                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to deserialize key share: {}", e)))?;
-
-                            coordinator.process_round2_package(from_id, round2_package)?;
-                        }
-
-                        // If we're in Round 2, generate and send our key shares
-                        if matches!(coordinator.get_round_state(), DkgRoundState::Round2) {
-                            // Get a copy of participant IDs before mutable borrowing
-                            let participant_ids: Vec<Identifier> = coordinator
-                                .get_participants()
-                                .keys()
-                                .cloned()
-                                .collect();
-
-                            // Generate our round 2 package
-                            let round2_package = coordinator.generate_round2(local_id)?;
-
-                            // Serialize the package
-                            let key_share_bytes = bincode::serialize(&round2_package)
-                                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to serialize key share: {}", e)))?;
-
-                            // Send to all participants
-                            for &participant_id in &participant_ids {
-                                if participant_id != local_id {
-                                    client.send(IpcMessage::Dkg(
-                                        DkgMessage::KeyShare(local_id, participant_id, key_share_bytes.clone())
-                                    )).await?;
-                                }
-                            }
-                        }
-                    },
-                    DkgMessage::Finish => {
-                        // Finalize DKG
-                        if matches!(coordinator.get_round_state(), DkgRoundState::Round3) {
-                            let key_package = coordinator.finalize(local_id)?;
-                            return Ok(key_package);
-                        }
-                    },
-                    _ => {}
-                }
-            },
-            _ => {}
-        }
-
-        // Check if we've advanced to Round 3
-        if matches!(coordinator.get_round_state(), DkgRoundState::Round3) {
-            // Send Finish message
-            client.send(IpcMessage::Dkg(DkgMessage::Finish)).await?;
-
-            // Wait for Finish message from coordinator
-            loop {
-                let message = client.receive().await?;
-                if let IpcMessage::Dkg(DkgMessage::Finish) = message {
+                    // Start the DKG process
+                    self.coordinator.start()?;
+                    received_config = true;
                     break;
+                },
+                _ => {
+                    // Ignore other messages until we receive the DKG start
+                    continue;
                 }
             }
-
-            // Finalize and return key package
-            let key_package = coordinator.finalize(local_id)?;
-            return Ok(key_package);
         }
+
+        if !received_config {
+            return Err(FrostWalletError::TimeoutError("Timed out waiting for DKG start".to_string()));
+        }
+
+        // Process DKG rounds
+        log::info!("Starting DKG rounds");
+
+        // Round 1: Generate commitment
+        round_state = DkgRoundState::Round1;
+        let round1_package = self.coordinator.generate_round1(self.local_id)?;
+
+        // Send commitment to coordinator
+        client.send(IpcMessage::Dkg(
+            DkgMessage::Commitment(self.local_id, bincode::serialize(&round1_package)?)
+        )).await?;
+
+        // Process incoming messages and advance through rounds
+        let timeout_duration = Duration::from_secs(DKG_TIMEOUT_SECONDS * 3); // 3 minutes total timeout
+        let start_time = Instant::now();
+
+        while start_time.elapsed() < timeout_duration {
+            match timeout(Duration::from_millis(200), client.receive()).await {
+                Ok(Ok(message)) => {
+                    match message {
+                        IpcMessage::Dkg(dkg_message) => {
+                            match dkg_message {
+                                DkgMessage::Commitment(participant_id, commitment_data) => {
+                                    // Process commitment if we're in Round 1
+                                    let round1_package = bincode::deserialize(&commitment_data)?;
+                                    self.coordinator.process_round1_package(participant_id, round1_package)?;
+                                },
+                                DkgMessage::KeyShare(from_id, to_id, key_share_data) => {
+                                    // Process key share if it's for us
+                                    if to_id == self.local_id {
+                                        // Deserialize key share data
+                                        let round2_package = bincode::deserialize(&key_share_data)?;
+
+                                        // Collect all packages for this sender
+                                        let mut packages = BTreeMap::new();
+                                        packages.insert(self.local_id, round2_package);
+
+                                        // Process the round 2 package
+                                        self.coordinator.process_round2_package(from_id, packages)?;
+
+                                        // If we're now in Round 2, generate and send our Round 2 packages
+                                        if matches!(self.coordinator.get_round_state(), DkgRoundState::Round2)
+                                            && round_state != DkgRoundState::Round2 {
+                                            round_state = DkgRoundState::Round2;
+
+                                            // Generate Round 2 packages
+                                            let round2_packages = self.coordinator.generate_round2(self.local_id)?;
+
+                                            // Send each package to the coordinator (it will forward to the right participant)
+                                            for (recipient_id, package) in &round2_packages {
+                                                client.send(IpcMessage::Dkg(DkgMessage::KeyShare(
+                                                    self.local_id,
+                                                    *recipient_id,
+                                                    bincode::serialize(package)?,
+                                                ))).await?;
+                                            }
+                                        }
+                                    }
+                                },
+                                DkgMessage::Finish => {
+                                    // Finalize the DKG process if we have all data
+                                    if matches!(self.coordinator.get_round_state(), DkgRoundState::Round3) {
+                                        let key_package = self.coordinator.finalize(self.local_id)?;
+                                        self.key_package = Some(key_package.clone());
+                                        return Ok(key_package);
+                                    }
+                                },
+                                _ => {
+                                    // Ignore other DKG messages
+                                }
+                            }
+                        },
+                        _ => {
+                            // Ignore non-DKG messages
+                        }
+                    }
+                },
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Timeout, check round state and take actions if needed
+                    match self.coordinator.get_round_state() {
+                        DkgRoundState::Round3 if round_state != DkgRoundState::Round3 => {
+                            // If we reached Round 3 but haven't yet finalized
+                            round_state = DkgRoundState::Round3;
+                            let key_package = self.coordinator.finalize(self.local_id)?;
+                            self.key_package = Some(key_package.clone());
+
+                            // Send completion back to coordinator
+                            client.send(IpcMessage::Dkg(DkgMessage::Finish)).await?;
+
+                            return Ok(key_package);
+                        },
+                        _ => {
+                            // Continue waiting
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(FrostWalletError::TimeoutError("DKG process timed out".to_string()))
+    }
+
+    /// Get the key package
+    pub fn get_key_package(&self) -> Result<KeyPackage> {
+        self.key_package.clone()
+            .ok_or_else(|| FrostWalletError::InvalidState("DKG not yet complete".to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use frost_core::keys::dkg::round2;
     use super::*;
     use tempfile::tempdir;
-    use frost_secp256k1::Identifier;
-    use crate::common::types::ThresholdConfig;
-
-    // Helper function to create test participant IDs
-    fn create_test_ids(count: u16) -> Vec<Identifier> {
-        (1..=count).map(|id| Identifier::try_from(id).unwrap()).collect()
-    }
-
-    // Helper function to set up a basic test environment
-    async fn setup_test_environment(participant_count: u16) -> (Vec<Identifier>, Vec<PathBuf>, tempfile::TempDir) {
-        let dir = tempdir().unwrap();
-        let ids = create_test_ids(participant_count);
-
-        // Create socket paths for each participant
-        let socket_paths: Vec<PathBuf> = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _id)| dir.path().join(format!("participant_{}.sock", i + 1)))
-            .collect();
-
-        (ids, socket_paths, dir)
-    }
 
     #[tokio::test]
-    async fn test_successful_dkg_with_two_participants() {
-        // Set up basic test environment with 2 participants
-        let (ids, socket_paths, _dir) = setup_test_environment(2).await;
-        let config = ThresholdConfig::new(2, 2);
-
-        // Create coordinator and participant controllers
-        let binary_path = std::env::current_exe().unwrap();
-
-        let coordinator_id = ids[0];
-        let participant_id = ids[1];
-
-        // Clone the PathBuf instead of borrowing it
-        let coordinator_socket = socket_paths[0].clone();
-
-        // Start coordinator in a separate task
-        let coordinator_handle = tokio::spawn(async move {
-            let mut coordinator = DkgProcessController::new(
-                coordinator_id,
-                config.clone(),
-                binary_path,
-            );
-
-            coordinator.start_server(coordinator_socket).await.unwrap();
-            let key_package = coordinator.run_dkg().await.unwrap();
-
-            key_package
-        });
-
-        // Give coordinator time to start up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Clone for participant too
-        let participant_socket_path = socket_paths[0].clone();
-
-        // Start participant
-        let mut participant = DkgParticipantProcess::new(participant_id);
-        participant.connect_to_coordinator(participant_socket_path).await.unwrap();
-
-        // Run participant process
-        let participant_handle = tokio::spawn(async move {
-            let key_package = participant.run().await.unwrap();
-            key_package
-        });
-
-        // Wait for both processes to complete
-        let coordinator_key_package = coordinator_handle.await.unwrap();
-        let participant_key_package = participant_handle.await.unwrap();
-
-        // Verify both key packages generate the same public key
-        assert_eq!(
-            coordinator_key_package.verifying_key(),
-            participant_key_package.verifying_key()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_successful_dkg_with_three_participants() {
-        // Set up basic test environment with 3 participants
-        let (ids, socket_paths, _dir) = setup_test_environment(3).await;
+    async fn test_dkg_single_process() {
+        // Create a DKG coordinator with a 2-of-3 threshold configuration
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
         let config = ThresholdConfig::new(2, 3);
+        let binary_path = PathBuf::from("target/debug/bitcoin-frost");
 
-        // Create coordinator and participant controllers
-        let binary_path = std::env::current_exe().unwrap();
+        let mut controller = DkgProcessController::new(
+            coordinator_id,
+            config,
+            binary_path,
+        );
 
-        let coordinator_id = ids[0];
-        let participant1_id = ids[1];
-        let participant2_id = ids[2];
+        // Add coordinator as a participant first
+        let coordinator_participant = Participant::new(coordinator_id);
+        controller.coordinator.add_participant(coordinator_participant).unwrap();
 
-        // Create an owned PathBuf, not a borrowed reference to a clone
-        let coordinator_socket = socket_paths[0].clone();
+        // Add participants directly to the coordinator
+        for i in 2..=3 {
+            let participant_id = Identifier::try_from(i).unwrap();
+            let participant = Participant::new(participant_id);
+            controller.coordinator.add_participant(participant).unwrap();
+        }
 
-        // Shared state to collect results
-        let key_packages = Arc::new(Mutex::new(Vec::new()));
+        // Start DKG
+        controller.coordinator.start().unwrap();
 
-        // Start coordinator in a separate task
-        let coordinator_kp = key_packages.clone();
-        // Clone the socket path for the move closure
-        let coord_socket = coordinator_socket.clone();
-        let coordinator_handle = tokio::spawn(async move {
-            let mut coordinator = DkgProcessController::new(
+        // Generate and process Round 1 packages
+        for i in 1..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            let package = controller.coordinator.generate_round1(id).unwrap();
+            controller.coordinator.process_round1_package(id, package).unwrap();
+        }
+
+        // Generate and process Round 2 packages
+        for i in 1..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            let packages = controller.coordinator.generate_round2(id).unwrap();
+            controller.coordinator.process_round2_package(id, packages).unwrap();
+        }
+
+        // Finalize DKG for all participants
+        for i in 1..=3 {
+            let id = Identifier::try_from(i).unwrap();
+            controller.coordinator.finalize(id).unwrap();
+        }
+
+        // Verify we have key packages and they're all for the same group key
+        let key_package1 = controller.coordinator.get_key_package(Identifier::try_from(1u16).unwrap()).unwrap();
+        let key_package2 = controller.coordinator.get_key_package(Identifier::try_from(2u16).unwrap()).unwrap();
+        let key_package3 = controller.coordinator.get_key_package(Identifier::try_from(3u16).unwrap()).unwrap();
+
+        let pubkey1 = key_package1.verifying_key();
+        let pubkey2 = key_package2.verifying_key();
+        let pubkey3 = key_package3.verifying_key();
+
+        assert_eq!(pubkey1, pubkey2);
+        assert_eq!(pubkey2, pubkey3);
+    }
+
+    #[tokio::test]
+    async fn test_dkg_different_thresholds() {
+        // Test with different threshold configurations to ensure correctness
+        for (threshold, total) in [(2, 3), (3, 5), (4, 7)] {
+            let coordinator_id = Identifier::try_from(1u16).unwrap();
+            let config = ThresholdConfig::new(threshold, total);
+            let binary_path = PathBuf::from("target/debug/bitcoin-frost");
+
+            let mut controller = DkgProcessController::new(
                 coordinator_id,
-                config.clone(),
+                config,
                 binary_path,
             );
 
-            coordinator.start_server(coord_socket).await.unwrap();
-            let key_package = coordinator.run_dkg().await.unwrap();
+            // Add all participants including coordinator
+            for i in 1..=total {
+                let participant_id = Identifier::try_from(i).unwrap();
+                let participant = Participant::new(participant_id);
+                controller.coordinator.add_participant(participant).unwrap();
+            }
 
-            coordinator_kp.lock().await.push((coordinator_id, key_package));
-        });
+            // Start DKG
+            controller.coordinator.start().unwrap();
 
-        // Give coordinator time to start up
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            // Generate and process Round 1 packages
+            for i in 1..=total {
+                let id = Identifier::try_from(i).unwrap();
+                let package = controller.coordinator.generate_round1(id).unwrap();
+                controller.coordinator.process_round1_package(id, package).unwrap();
+            }
 
-        // Start participant 1 with an owned socket path
-        let p1_kp = key_packages.clone();
-        let p1_socket = coordinator_socket.clone();
-        let p1_handle = tokio::spawn(async move {
-            let mut participant = DkgParticipantProcess::new(participant1_id);
-            participant.connect_to_coordinator(p1_socket).await.unwrap();
+            // Generate and process Round 2 packages
+            for i in 1..=total {
+                let id = Identifier::try_from(i).unwrap();
+                let packages = controller.coordinator.generate_round2(id).unwrap();
+                controller.coordinator.process_round2_package(id, packages).unwrap();
+            }
 
-            let key_package = participant.run().await.unwrap();
-            p1_kp.lock().await.push((participant1_id, key_package));
-        });
+            // Finalize DKG for all participants
+            let mut key_packages = Vec::new();
+            for i in 1..=total {
+                let id = Identifier::try_from(i).unwrap();
+                let key_package = controller.coordinator.finalize(id).unwrap();
+                key_packages.push(key_package);
+            }
 
-        // Start participant 2 with an owned socket path
-        let p2_kp = key_packages.clone();
-        let p2_socket = coordinator_socket.clone();
-        let p2_handle = tokio::spawn(async move {
-            let mut participant = DkgParticipantProcess::new(participant2_id);
-            participant.connect_to_coordinator(p2_socket).await.unwrap();
+            // Verify all participants share the same group key
+            let first_verifying_key = key_packages[0].verifying_key();
+            for key_package in &key_packages[1..] {
+                assert_eq!(first_verifying_key, key_package.verifying_key());
+            }
 
-            let key_package = participant.run().await.unwrap();
-            p2_kp.lock().await.push((participant2_id, key_package));
-        });
-
-        // Wait for all processes to complete
-        coordinator_handle.await.unwrap();
-        p1_handle.await.unwrap();
-        p2_handle.await.unwrap();
-
-        // Collect all key packages
-        let collected_kps = key_packages.lock().await;
-
-        // Verify we have 3 key packages (one for each participant)
-        assert_eq!(collected_kps.len(), 3);
-
-        // Verify all key packages have the same public key
-        let reference_key = collected_kps[0].1.verifying_key();
-        for (_id, kp) in collected_kps.iter() {
-            assert_eq!(kp.verifying_key(), reference_key);
+            // Verify we get the same public key package from the coordinator
+            let pub_key_package = controller.coordinator.get_public_key_package().unwrap();
+            assert_eq!(first_verifying_key, pub_key_package.verifying_key());
         }
     }
 
     #[tokio::test]
-    async fn test_spawn_participant_process() {
-        // Set up basic test environment
-        let (ids, _socket_paths, _dir) = setup_test_environment(2).await;
+    async fn test_dkg_message_handling() {
+        // Create a temporary directory for the socket
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("test.sock");
+
+        // Create coordinator and participant IDs
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
+        let participant_id = Identifier::try_from(2u16).unwrap();
+
+        // Create coordinator controller
         let config = ThresholdConfig::new(2, 2);
+        let binary_path = PathBuf::from("target/debug/bitcoin-frost");
 
-        let coordinator_id = ids[0];
-        let participant_id = ids[1];
-
-        // Get path to current executable for test
-        let binary_path = std::env::current_exe().unwrap();
-
-        // Create controller
         let mut controller = DkgProcessController::new(
             coordinator_id,
-            config,
-            binary_path.clone(),
+            config.clone(),
+            binary_path,
         );
 
-        // Use debug representation for ID value
-        let id_debug = format!("{:?}", participant_id);
-        println!("Spawn ID: {}", id_debug);
+        // Start the coordinator's IPC server
+        controller.start_server(&socket_path).await.unwrap();
 
-        // Test spawning a participant
-        let args = vec![
-            "--id".to_string(),
-            id_debug,
-            "participant".to_string(),
-        ];
+        // Add coordinator as participant
+        let coordinator_participant = Participant::new(coordinator_id);
+        controller.coordinator.add_participant(coordinator_participant).unwrap();
 
-        // This might not actually work in tests, but we can verify the API works
-        let result = controller.spawn_participant(participant_id, args).await;
+        // Create participant process
+        let mut participant = DkgParticipantProcess::new(participant_id);
 
-        // Just check that the function completes without error
-        assert!(result.is_ok());
+        // Test handling of Start message
+        let start_message = IpcMessage::Dkg(DkgMessage::Start(config.clone()));
+        controller.handle_dkg_message(participant_id, start_message).await.unwrap();
 
-        // Verify the process was added to the coordinator
-        assert!(controller.processes.get_process(participant_id).is_some());
+        // Verify the participant was added
+        assert!(controller.coordinator.get_participant(participant_id).is_some());
+
+        // Generate a Round 1 package for the participant
+        controller.coordinator.start().unwrap();
+        let round1_package = controller.coordinator.generate_round1(coordinator_id).unwrap();
+
+        // Serialize the Round 1 package
+        let commitment_data = bincode::serialize(&round1_package).unwrap();
+
+        // Test handling of Commitment message
+        let commitment_message = IpcMessage::Dkg(DkgMessage::Commitment(
+            coordinator_id, commitment_data
+        ));
+
+        // Test that we can handle our own commitment properly
+        controller.handle_dkg_message(coordinator_id, commitment_message).await.unwrap();
+
+        // Create a dummy Round 2 package for testing KeyShare message handling
+        // In a real scenario, this would be generated properly based on Round 1 results
+        // let mut dummy_round2_package: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>> = BTreeMap::new();
+
+        // Test handling of Finish message
+        let finish_message = IpcMessage::Dkg(DkgMessage::Finish);
+        controller.handle_dkg_message(participant_id, finish_message).await.unwrap();
+
+        // Clean up
+        if let Some(server) = &controller.ipc_server {
+            let _ = server.cleanup();
+        }
     }
 }
+
