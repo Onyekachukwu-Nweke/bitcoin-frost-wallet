@@ -9,7 +9,7 @@ use rand_core::OsRng;
 use std::collections::BTreeMap;
 
 /// State for a ChillDKG round
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialOrd, PartialEq)]
 pub enum DkgRoundState {
     /// Round 1: Generate and share commitments
     Round1,
