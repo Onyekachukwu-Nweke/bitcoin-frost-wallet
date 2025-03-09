@@ -61,6 +61,14 @@ impl FrostCoordinator {
         &self.participants
     }
 
+    /// Get the count of commitments in the current signing session
+    pub fn get_commitments_count(&self) -> usize {
+        match &self.commitments {
+            Some(commitments) => commitments.len(),
+            None => 0
+        }
+    }
+
     /// Start a new signing session
     pub fn start_signing(&mut self, message: Vec<u8>) -> Result<()> {
         self.commitments = Some(BTreeMap::new());
