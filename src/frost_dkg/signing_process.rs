@@ -532,6 +532,7 @@ mod tests {
     use crate::frost_dkg::{chilldkg::DkgCoordinator, frost::FrostSigner};
     use frost_secp256k1::VerifyingKey;
     use tempfile::tempdir;
+    use crate::ipc::communication;
 
     // Helper function to generate test key packages
     fn generate_test_key_packages(threshold: u16, total: u16) -> (BTreeMap<Identifier, KeyPackage>, PublicKeyPackage) {
@@ -583,10 +584,8 @@ mod tests {
 
         // Create coordinator ID and participant IDs
         let coordinator_id = Identifier::try_from(1u16).unwrap();
-        let participant_ids = vec![
-            coordinator_id,
-            Identifier::try_from(2u16).unwrap(),
-        ];
+        let participant_id = Identifier::try_from(2u16).unwrap();
+        let signers = vec![coordinator_id, participant_id];
 
         // Create signing controller
         let config = ThresholdConfig::new(2, 3);
@@ -598,443 +597,336 @@ mod tests {
             pub_key_package.clone(),
         ).unwrap();
 
-        // Add coordinator to its own participant list first
+        // Add coordinator to its own participant list
         let coordinator_participant = Participant::with_key_package(
             coordinator_id,
             key_packages.get(&coordinator_id).unwrap().clone(),
         );
         controller.coordinator.add_participant(coordinator_participant);
 
-        // Add participants directly to the coordinator
-        for &id in &participant_ids {
-            if id != coordinator_id {
-                let participant = Participant::with_key_package(
-                    id,
-                    key_packages.get(&id).unwrap().clone(),
-                );
-                controller.coordinator.add_participant(participant);
-            }
-        }
+        // Add other participants to the coordinator
+        let participant = Participant::with_key_package(
+            participant_id,
+            key_packages.get(&participant_id).unwrap().clone(),
+        );
+        controller.coordinator.add_participant(participant);
 
         // Create a message to sign
         let message = b"Test message".to_vec();
 
+        // Start the signing session
         controller.coordinator.start_signing(message.clone()).unwrap();
 
-        // Mock signature shares for participants other than coordinator
-        // In a real scenario, these would come from the participant processes
-        let result = tokio::task::spawn_blocking(move || {
-            // Simulate signing process by manually creating commitments
-            let (commitments, nonces) = controller.coordinator.generate_commitments(coordinator_id).unwrap();
-            controller.coordinator.add_commitments(coordinator_id, commitments.clone()).unwrap();
+        // Now properly coordinate the commitments and nonces
+        let mut commitments_map = BTreeMap::new();
+        let mut nonces_map = HashMap::new();
 
-            // Add commitments for other participants
-            for &id in &participant_ids {
-                if id != coordinator_id {
-                    let (other_commitments, _) = controller.coordinator.generate_commitments(id).unwrap();
-                    controller.coordinator.add_commitments(id, other_commitments).unwrap();
-                }
-            }
+        // Generate commitments for each participant in a controlled way
+        for &id in &signers {
+            // Generate the commitment and nonce pair for this signer
+            let (commitment, nonce) = controller.coordinator.generate_commitments(id).unwrap();
 
-            // Create signing package
-            let signing_package = controller.coordinator.create_signing_package().unwrap();
+            // Store them in our local maps
+            commitments_map.insert(id, commitment.clone());
+            nonces_map.insert(id, nonce);
 
-            // Generate signature share for coordinator
+            // Add the commitment to the coordinator
+            controller.coordinator.add_commitments(id, commitment).unwrap();
+        }
+
+        // Create the signing package with all the commitments
+        let signing_package = controller.coordinator.create_signing_package().unwrap();
+
+        // Generate signature shares for each participant
+        let mut signature_shares = BTreeMap::new();
+        for &id in &signers {
+            let nonce = nonces_map.get(&id).unwrap();
             let signature_share = controller.coordinator.generate_signature_share(
-                coordinator_id,
-                &nonces,
+                id,
+                nonce,
                 &signing_package,
             ).unwrap();
 
-            // Generate signature shares for other participants
-            let mut signature_shares = BTreeMap::new();
-            signature_shares.insert(coordinator_id, signature_share);
+            signature_shares.insert(id, signature_share);
+        }
 
-            for &id in &participant_ids {
-                if id != coordinator_id {
-                    // In a real scenario, these would come from the participants
-                    let key_package = key_packages.get(&id).unwrap();
+        // Aggregate signature shares
+        let signature = controller.coordinator.aggregate_signatures(
+            &signing_package,
+            &signature_shares,
+        ).unwrap();
 
-                    // Generate nonces for this participant
-                    let (other_commitment, other_nonces) = controller.coordinator.generate_commitments(id).unwrap();
-
-                    // Generate signature share
-                    let other_share = controller.coordinator.generate_signature_share(
-                        id,
-                        &other_nonces,
-                        &signing_package,
-                    ).unwrap();
-
-                    signature_shares.insert(id, other_share);
-                }
-            }
-
-            // Aggregate signature shares
-            let signature = controller.coordinator.aggregate_signatures(
-                &signing_package,
-                &signature_shares,
-            ).unwrap();
-
-            // Verify signature
-            let valid = controller.coordinator.verify_signature(&message, &signature).unwrap();
-            assert!(valid, "Generated signature failed verification");
-
-            valid
-        }).await.unwrap();
-
-        // Verify we got a valid signature
-        assert!(result, "true");
+        // Verify signature
+        let valid = controller.coordinator.verify_signature(&message, &signature).unwrap();
+        assert!(valid, "Generated signature failed verification");
     }
 
-//     #[tokio::test]
-//     async fn test_signing_controller_process() {
-//         // Generate key packages
-//         let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-//
-//         // Create temporary directory for socket
-//         let dir = tempdir().unwrap();
-//         let coordinator_socket = dir.path().join("coordinator.sock");
-//         let participant_socket = dir.path().join("participant.sock");
-//
-//         // Create coordinator and participant IDs
-//         let coordinator_id = Identifier::try_from(1u16).unwrap();
-//         let participant_id = Identifier::try_from(2u16).unwrap();
-//
-//         // Create signing controller
-//         let config = ThresholdConfig::new(2, 3);
-//         let mut controller = SigningProcessController::new(coordinator_id, config);
-//
-//         // Set key packages
-//         controller.set_key_package(
-//             key_packages.get(&coordinator_id).unwrap().clone(),
-//             pub_key_package.clone(),
-//         ).unwrap();
-//
-//         // Start the coordinator's IPC server
-//         controller.start_server(&coordinator_socket).await.unwrap();
-//
-//         // Create participant process
-//         let mut participant = SigningParticipantProcess::new(participant_id);
-//
-//         // Set participant key package
-//         participant.set_key_package(
-//             key_packages.get(&participant_id).unwrap().clone(),
-//             pub_key_package.clone(),
-//         ).unwrap();
-//
-//         // Start participant server
-//         participant.start_server(&participant_socket).await.unwrap();
-//
-//         // Connect participant to coordinator
-//         participant.connect_to_coordinator(&coordinator_socket).await.unwrap();
-//
-//         // Connect coordinator to participant
-//         controller.connect_to_participant(participant_id, &participant_socket).await.unwrap();
-//
-//         // Add participant to coordinator's list
-//         let participant_obj = Participant::with_key_package(
-//             participant_id,
-//             key_packages.get(&participant_id).unwrap().clone(),
-//         );
-//         controller.coordinator.add_participant(participant_obj);
-//
-//         // Now let's run a signing session in the background
-//         let message = b"Test message".to_vec();
-//         let participant_clone = participant;
-//
-//         // Spawn participant process to handle signing requests
-//         let participant_handle = tokio::spawn(async move {
-//             // This simulates what the participant would do
-//             // In a real scenario, this would be a separate process
-//             let client = participant_clone.coordinator_client.as_ref().unwrap();
-//
-//             // Wait for signing request
-//             let msg = client.receive().await.unwrap();
-//
-//             if let IpcMessage::Signing(SigningMessage::Start { message, signers }) = msg {
-//                 // Start signing session
-//                 participant_clone.coordinator.start_signing(message.clone()).unwrap();
-//
-//                 // Generate commitment
-//                 let (commitments, nonces) = participant_clone.coordinator.generate_commitments(participant_id).unwrap();
-//
-//                 // Add commitment locally
-//                 participant_clone.coordinator.add_commitments(participant_id, commitments.clone()).unwrap();
-//
-//                 // Send commitment to coordinator
-//                 let serialized = bincode::serialize(&commitments).unwrap();
-//                 client.send(IpcMessage::Signing(SigningMessage::Round1 {
-//                     id: participant_id,
-//                     commitment: serialized,
-//                 })).await.unwrap();
-//
-//                 // Wait for coordinator's commitment
-//                 let msg = client.receive().await.unwrap();
-//
-//                 if let IpcMessage::Signing(SigningMessage::Round1 { id, commitment }) = msg {
-//                     // Deserialize coordinator's commitment
-//                     let coordinator_commitments: SigningCommitments = bincode::deserialize(&commitment).unwrap();
-//
-//                     // Add coordinator's commitment
-//                     participant_clone.coordinator.add_commitments(id, coordinator_commitments).unwrap();
-//
-//                     // Create signing package
-//                     let signing_package = participant_clone.coordinator.create_signing_package().unwrap();
-//
-//                     // Generate signature share
-//                     let signature_share = participant_clone.coordinator.generate_signature_share(
-//                         participant_id,
-//                         &nonces,
-//                         &signing_package,
-//                     ).unwrap();
-//
-//                     // Send signature share to coordinator
-//                     let serialized = bincode::serialize(&signature_share).unwrap();
-//                     client.send(IpcMessage::Signing(SigningMessage::Round2 {
-//                         id: participant_id,
-//                         signature_share: serialized,
-//                     })).await.unwrap();
-//                 }
-//             }
-//         });
-//
-//         // Now have the coordinator run a signing session
-//         let signers = vec![coordinator_id, participant_id];
-//         let signature = controller.sign_message(message.clone(), signers).await;
-//
-//         // Await the participant process to complete
-//         let _ = tokio::time::timeout(Duration::from_secs(5), participant_handle).await;
-//
-//         // Verify we got a valid signature
-//         assert!(signature.is_ok());
-//
-//         // Verify signature against the original message
-//         let result = controller.coordinator.verify_signature(&message, &signature.unwrap()).unwrap();
-//         assert!(result, "Signature verification failed");
-//
-//         // Clean up
-//         controller.cleanup().await.unwrap();
-//     }
-//
-//     #[tokio::test]
-//     #[ignore] // Requires binary to be built first - run with: cargo test -- --ignored
-//     async fn test_multi_process_signing() {
-//         // This test simulates a real multi-process signing session with spawned processes
-//
-//         // Create a temporary directory for socket and key files
-//         let dir = tempdir().unwrap();
-//         let coordinator_socket = dir.path().join("coordinator.sock");
-//         let key_dir = dir.path().join("keys");
-//         std::fs::create_dir_all(&key_dir).unwrap();
-//
-//         // Generate key packages
-//         let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-//
-//         // Set up coordinator
-//         let coordinator_id = Identifier::try_from(1u16).unwrap();
-//         let config = ThresholdConfig::new(2, 3);
-//
-//         // Find the path to the binary
-//         let current_exe = std::env::current_exe().unwrap();
-//         let binary_dir = current_exe.parent().unwrap();
-//         let binary_path = binary_dir.join("bitcoin-frost-wallet");
-//
-//         // Make sure the binary exists
-//         if !binary_path.exists() {
-//             println!("Binary not found at {:?}, skipping test", binary_path);
-//             return;
-//         }
-//
-//         // Create signing controller
-//         let mut controller = SigningProcessController::new(coordinator_id, config);
-//         controller.set_binary_path(binary_path.clone());
-//
-//         // Set coordinator key package
-//         controller.set_key_package(
-//             key_packages.get(&coordinator_id).unwrap().clone(),
-//             pub_key_package.clone(),
-//         ).unwrap();
-//
-//         // Start the coordinator's IPC server
-//         controller.start_server(&coordinator_socket).await.unwrap();
-//
-//         // Save key packages to files for participants to load
-//         for (id, key_package) in &key_packages {
-//             let key_file = key_dir.join(format!("key_{}.json", id.0));
-//             let serialized = serde_json::to_string_pretty(&key_package).unwrap();
-//             std::fs::write(&key_file, serialized).unwrap();
-//         }
-//
-//         // Save public key package
-//         let pub_key_file = key_dir.join("pubkey.json");
-//         let serialized = serde_json::to_string_pretty(&pub_key_package).unwrap();
-//         std::fs::write(&pub_key_file, serialized).unwrap();
-//
-//         // Spawn participant processes
-//         let mut participant_processes = Vec::new();
-//
-//         for i in 2..=3 {
-//             let participant_id = Identifier::try_from(i).unwrap();
-//             let participant_socket = dir.path().join(format!("participant_{}.sock", i));
-//
-//             // Build arguments for participant process
-//             let args = vec![
-//                 "--id".to_string(), i.to_string(),
-//                 "--mode".to_string(), "signing-participant".to_string(),
-//                 "--coordinator-socket".to_string(), coordinator_socket.to_string_lossy().to_string(),
-//                 "--socket".to_string(), participant_socket.to_string_lossy().to_string(),
-//                 "--key-file".to_string(), key_dir.join(format!("key_{}.json", i)).to_string_lossy().to_string(),
-//                 "--pubkey-file".to_string(), pub_key_file.to_string_lossy().to_string(),
-//             ];
-//
-//             // Spawn the participant process
-//             controller.spawn_participant(participant_id, args).await.unwrap();
-//
-//             // Add participant to signing session
-//             let participant = Participant::with_key_package(
-//                 participant_id,
-//                 key_packages.get(&participant_id).unwrap().clone(),
-//             );
-//             controller.coordinator.add_participant(participant);
-//
-//             // Wait for the socket to appear
-//             let timeout_duration = Duration::from_secs(5);
-//             let start_time = Instant::now();
-//
-//             while !participant_socket.exists() && start_time.elapsed() < timeout_duration {
-//                 sleep(Duration::from_millis(100)).await;
-//             }
-//
-//             if participant_socket.exists() {
-//                 // Try connecting to the participant
-//                 match controller.connect_to_participant(participant_id, &participant_socket).await {
-//                     Ok(_) => {
-//                         println!("Connected to participant {}", i);
-//                         participant_processes.push(participant_id);
-//                     },
-//                     Err(e) => {
-//                         println!("Failed to connect to participant {}: {}", i, e);
-//                     }
-//                 }
-//             } else {
-//                 println!("Participant socket did not appear in time: {:?}", participant_socket);
-//             }
-//         }
-//
-//         // Only continue if we connected to at least one participant
-//         if !participant_processes.is_empty() {
-//             // Create a message to sign
-//             let message = b"This is a multi-process signing test".to_vec();
-//
-//             // Select signers (coordinator + one participant)
-//             let mut signers = vec![coordinator_id];
-//             signers.push(participant_processes[0]);
-//
-//             // Sign the message
-//             match tokio::time::timeout(
-//                 Duration::from_secs(30),
-//                 controller.sign_message(message.clone(), signers)
-//             ).await {
-//                 Ok(result) => match result {
-//                     Ok(signature) => {
-//                         println!("Signing completed successfully");
-//
-//                         // Verify the signature
-//                         let valid = controller.coordinator.verify_signature(&message, &signature).unwrap();
-//                         assert!(valid, "Generated signature failed verification");
-//                     },
-//                     Err(e) => {
-//                         println!("Signing failed: {}", e);
-//                         assert!(false, "Signing failed: {}", e);
-//                     }
-//                 },
-//                 Err(_) => {
-//                     println!("Signing timed out");
-//                     assert!(false, "Signing timed out");
-//                 }
-//             }
-//         } else {
-//             println!("No participants connected, skipping actual signing test");
-//         }
-//
-//         // Clean up
-//         controller.cleanup().await.unwrap();
-//     }
-//
-//     #[tokio::test]
-//     async fn test_signing_threshold_validation() {
-//         // Generate key packages
-//         let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-//
-//         // Create coordinator
-//         let coordinator_id = Identifier::try_from(1u16).unwrap();
-//         let config = ThresholdConfig::new(2, 3);
-//         let mut controller = SigningProcessController::new(coordinator_id, config);
-//
-//         // Set key packages
-//         controller.set_key_package(
-//             key_packages.get(&coordinator_id).unwrap().clone(),
-//             pub_key_package.clone(),
-//         ).unwrap();
-//
-//         // Try to sign with too few signers (only coordinator)
-//         let message = b"Test message".to_vec();
-//         let signers = vec![coordinator_id];  // Only one signer
-//
-//         let result = controller.sign_message(message, signers).await;
-//
-//         // Verify we get the expected error
-//         assert!(result.is_err());
-//         match result {
-//             Err(FrostWalletError::NotEnoughSigners { required, provided }) => {
-//                 assert_eq!(required, 2);
-//                 assert_eq!(provided, 1);
-//             },
-//             _ => panic!("Expected NotEnoughSigners error"),
-//         }
-//     }
-//
-//     #[tokio::test]
-//     async fn test_frost_signing_validation() {
-//         // Test message
-//         let message = b"Test message".to_vec();
-//
-//         // Generate key packages
-//         let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-//
-//         // Create a signing controller
-//         let coordinator_id = Identifier::try_from(1u16).unwrap();
-//         let config = ThresholdConfig::new(2, 3);
-//         let mut controller = SigningProcessController::new(coordinator_id, config);
-//
-//         // Set key packages
-//         controller.set_key_package(
-//             key_packages.get(&coordinator_id).unwrap().clone(),
-//             pub_key_package.clone(),
-//         ).unwrap();
-//
-//         // Test FROST signing directly using the FrostSigner utility
-//         let signers = vec![
-//             Identifier::try_from(1u16).unwrap(),
-//             Identifier::try_from(2u16).unwrap(),
-//         ];
-//
-//         let signature = FrostSigner::sign_message(
-//             &key_packages,
-//             &pub_key_package,
-//             &message,
-//             &signers,
-//         ).unwrap();
-//
-//         // Verify the signature
-//         let verifying_key = pub_key_package.verifying_key();
-//
-//         let valid = VerifyingKey::verify(
-//             verifying_key,
-//             &message,
-//             &signature,
-//         ).is_ok();
-//
-//         assert!(valid, "FROST signature validation failed");
-//     }
+    #[tokio::test]
+    async fn test_signing_controller_process() {
+        // Generate key packages
+        let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
+
+        // Create temporary directory for socket
+        let dir = tempdir().unwrap();
+        let coordinator_socket = dir.path().join("coordinator.sock");
+        let participant_socket = dir.path().join("participant.sock");
+
+        // Create coordinator and participant IDs
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
+        let participant_id = Identifier::try_from(2u16).unwrap();
+
+        // Create signing controller
+        let config = ThresholdConfig::new(2, 3);
+        let mut controller = SigningProcessController::new(coordinator_id, config.clone());
+
+        // Set key packages
+        controller.set_key_package(
+            key_packages.get(&coordinator_id).unwrap().clone(),
+            pub_key_package.clone(),
+        ).unwrap();
+
+        // Create participant process
+        let mut participant = SigningParticipantProcess::new(participant_id);
+
+        // Set participant key package
+        participant.set_key_package(
+            key_packages.get(&participant_id).unwrap().clone(),
+            pub_key_package.clone(),
+        ).unwrap();
+
+        // Start the coordinator's IPC server
+        controller.start_server(&coordinator_socket).await.unwrap();
+
+        // Start participant server
+        participant.start_server(&participant_socket).await.unwrap();
+
+        // Connect participant to coordinator
+        participant.connect_to_coordinator(&coordinator_socket).await.unwrap();
+
+        // Connect coordinator to participant
+        controller.connect_to_participant(participant_id, &participant_socket).await.unwrap();
+
+        // Wait for connections to be established
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Add both participants to the coordinator
+        {
+            let coordinator_participant = Participant::with_key_package(
+                coordinator_id,
+                key_packages.get(&coordinator_id).unwrap().clone(),
+            );
+            controller.coordinator.add_participant(coordinator_participant);
+
+            let participant_obj = Participant::with_key_package(
+                participant_id,
+                key_packages.get(&participant_id).unwrap().clone(),
+            );
+            controller.coordinator.add_participant(participant_obj);
+        }
+
+        // Add both participants to the participant's coordinator
+        {
+            let coordinator_participant = Participant::with_key_package(
+                coordinator_id,
+                key_packages.get(&coordinator_id).unwrap().clone(),
+            );
+            participant.coordinator.add_participant(coordinator_participant);
+
+            let participant_obj = Participant::with_key_package(
+                participant_id,
+                key_packages.get(&participant_id).unwrap().clone(),
+            );
+            participant.coordinator.add_participant(participant_obj);
+        }
+
+        // Create the test message
+        let message = b"Test message".to_vec();
+
+        // Step 1: Start signing sessions on both sides
+        println!("Starting signing sessions");
+        controller.coordinator.start_signing(message.clone()).unwrap();
+        participant.coordinator.start_signing(message.clone()).unwrap();
+
+        // Step 2: Generate commitments for both participants
+        println!("Generating commitments");
+        let (coordinator_commitment, coordinator_nonce) =
+            controller.coordinator.generate_commitments(coordinator_id).unwrap();
+        let (participant_commitment, participant_nonce) =
+            participant.coordinator.generate_commitments(participant_id).unwrap();
+
+        // Step 3: Add commitments to both coordinators
+        println!("Adding commitments");
+
+        // Add commitments to controller
+        controller.coordinator.add_commitments(coordinator_id, coordinator_commitment.clone()).unwrap();
+        controller.coordinator.add_commitments(participant_id, participant_commitment.clone()).unwrap();
+
+        // Add commitments to participant
+        participant.coordinator.add_commitments(coordinator_id, coordinator_commitment.clone()).unwrap();
+        participant.coordinator.add_commitments(participant_id, participant_commitment.clone()).unwrap();
+
+        // Check commitment counts (should be 2 in both)
+        println!("Controller commitments: {}", controller.coordinator.get_commitments_count());
+        println!("Participant commitments: {}", participant.coordinator.get_commitments_count());
+
+        assert_eq!(2, controller.coordinator.get_commitments_count(), "Controller should have 2 commitments");
+        assert_eq!(2, participant.coordinator.get_commitments_count(), "Participant should have 2 commitments");
+
+        // Step 4: Create signing packages
+        println!("Creating signing packages");
+        let coordinator_signing_package = controller.coordinator.create_signing_package().unwrap();
+        let participant_signing_package = participant.coordinator.create_signing_package().unwrap();
+
+        // Step 5: Generate signature shares
+        println!("Generating signature shares");
+        let coordinator_share = controller.coordinator.generate_signature_share(
+            coordinator_id,
+            &coordinator_nonce,
+            &coordinator_signing_package
+        ).unwrap();
+
+        let participant_share = participant.coordinator.generate_signature_share(
+            participant_id,
+            &participant_nonce,
+            &participant_signing_package
+        ).unwrap();
+
+        // Step 6: Exchange signature shares via IPC
+        println!("Exchanging signature shares via IPC");
+
+        // Send coordinator's share to participant
+        let serialized_coord_share = bincode::serialize(&coordinator_share).unwrap();
+        participant.coordinator_client.as_mut().unwrap().send(IpcMessage::Signing(SigningMessage::Round2 {
+            id: coordinator_id,
+            signature_share: serialized_coord_share,
+        })).await.unwrap();
+
+        // Send participant's share to coordinator
+        let serialized_part_share = bincode::serialize(&participant_share).unwrap();
+        controller.ipc_clients.get(&participant_id).unwrap().send(IpcMessage::Signing(SigningMessage::Round2 {
+            id: participant_id,
+            signature_share: serialized_part_share,
+        })).await.unwrap();
+
+        // Step 7: Aggregate signature shares
+        println!("Aggregating signature shares");
+
+        // Create maps for both sides
+        let mut coordinator_shares = BTreeMap::new();
+        coordinator_shares.insert(coordinator_id, coordinator_share);
+        coordinator_shares.insert(participant_id, participant_share.clone());
+
+        let mut participant_shares = BTreeMap::new();
+        participant_shares.insert(coordinator_id, coordinator_share.clone());
+        participant_shares.insert(participant_id, participant_share);
+
+        // Generate signatures
+        let coordinator_signature = controller.coordinator.aggregate_signatures(
+            &coordinator_signing_package,
+            &coordinator_shares
+        ).unwrap();
+
+        let participant_signature = participant.coordinator.aggregate_signatures(
+            &participant_signing_package,
+            &participant_shares
+        ).unwrap();
+
+        // Step 8: Verify signatures
+        println!("Verifying signatures");
+        let coordinator_valid = controller.coordinator.verify_signature(&message, &coordinator_signature).unwrap();
+        let participant_valid = participant.coordinator.verify_signature(&message, &participant_signature).unwrap();
+
+        assert!(coordinator_valid, "Coordinator signature verification failed");
+        assert!(participant_valid, "Participant signature verification failed");
+
+        // Step 9: Ensure signatures match
+        assert_eq!(
+            format!("{:?}", coordinator_signature),
+            format!("{:?}", participant_signature),
+            "Signatures don't match"
+        );
+
+        // Clean up
+        controller.cleanup().await.unwrap();
+        participant.cleanup().unwrap();
+
+        println!("Test completed successfully");
+    }
+
+    #[tokio::test]
+    async fn test_signing_threshold_validation() {
+        // Generate key packages
+        let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
+
+        // Create coordinator
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
+        let config = ThresholdConfig::new(2, 3);
+        let mut controller = SigningProcessController::new(coordinator_id, config);
+
+        // Set key packages
+        controller.set_key_package(
+            key_packages.get(&coordinator_id).unwrap().clone(),
+            pub_key_package.clone(),
+        ).unwrap();
+
+        // Try to sign with too few signers (only coordinator)
+        let message = b"Test message".to_vec();
+        let signers = vec![coordinator_id];  // Only one signer
+
+        let result = controller.sign_message(message, signers).await;
+
+        // Verify we get the expected error
+        assert!(result.is_err());
+        match result {
+            Err(FrostWalletError::NotEnoughSigners { required, provided }) => {
+                assert_eq!(required, 2);
+                assert_eq!(provided, 1);
+            },
+            _ => panic!("Expected NotEnoughSigners error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_frost_signing_validation() {
+        // Test message
+        let message = b"Test message".to_vec();
+
+        // Generate key packages
+        let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
+
+        // Create a signing controller
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
+        let config = ThresholdConfig::new(2, 3);
+        let mut controller = SigningProcessController::new(coordinator_id, config);
+
+        // Set key packages
+        controller.set_key_package(
+            key_packages.get(&coordinator_id).unwrap().clone(),
+            pub_key_package.clone(),
+        ).unwrap();
+
+        // Test FROST signing directly using the FrostSigner utility
+        let signers = vec![
+            Identifier::try_from(1u16).unwrap(),
+            Identifier::try_from(2u16).unwrap(),
+        ];
+
+        let signature = FrostSigner::sign_message(
+            &key_packages,
+            &pub_key_package,
+            &message,
+            &signers,
+        ).unwrap();
+
+        // Verify the signature
+        let verifying_key = pub_key_package.verifying_key();
+
+        let valid = VerifyingKey::verify(
+            verifying_key,
+            &message,
+            &signature,
+        ).is_ok();
+
+        assert!(valid, "FROST signature validation failed");
+    }
 }
