@@ -26,7 +26,7 @@ pub struct DkgProcessController {
     /// Threshold configuration
     config: ThresholdConfig,
     /// DKG coordinator
-    coordinator: DkgCoordinator,
+    pub(crate) coordinator: DkgCoordinator,
     /// Process coordinator
     processes: ProcessCoordinator,
     /// IPC server
