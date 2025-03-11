@@ -6,10 +6,11 @@ use crate::frost_dkg::frost::FrostCoordinator;
 use crate::frost_dkg::signing_process::SigningProcessController;
 
 use bitcoin::{
-    hex::{FromHex, DisplayHex}, Address, Network,
-    Script, Transaction, TxIn, TxOut, OutPoint, consensus::encode::serialize_hex,
-    sighash::TapSighash, Amount, hashes::Hash, psbt::Psbt,
-    secp256k1::{Secp256k1, XOnlyPublicKey, Message}, Txid, transaction};
+    Address, Network, ScriptBuf, Transaction, TxIn, TxOut, OutPoint,
+    consensus::encode::serialize_hex, sighash::TapSighash, Amount, hashes::Hash,
+    psbt::Psbt, secp256k1::{Secp256k1, XOnlyPublicKey, Message},
+    Txid, transaction, Sequence, Witness
+};
 use frost_secp256k1::{
     Identifier, Signature,
     keys::{KeyPackage, PublicKeyPackage},
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
+use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode;
 use tokio::sync::Mutex;
 
@@ -200,7 +202,7 @@ impl BitcoinFrostWallet {
         let pk_bytes: Vec<u8> = verifying_key.serialize().unwrap().to_vec();
 
         // Create XOnly public key for Taproot address
-        let xonly_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&pk_bytes)
+        let xonly_pubkey = XOnlyPublicKey::from_slice(&pk_bytes)
             .map_err(|e| FrostWalletError::InvalidState(format!("Invalid public key: {}", e)))?;
 
         // Create P2TR (Taproot) address
@@ -221,16 +223,14 @@ impl BitcoinFrostWallet {
             return Err(FrostWalletError::InvalidState("Wallet not initialized".to_string()));
         }
 
-        // Parse recipient address
+        // Parse recipient address and make sure it's for the correct network
         let recipient_address = Address::from_str(recipient)
-            .map_err(|_| FrostWalletError::InvalidState(format!("Invalid address: {}", recipient)))?;
-
-        if recipient_address.network() != self.network {
-            return Err(FrostWalletError::InvalidState(
+            .map_err(|_| FrostWalletError::InvalidState(format!("Invalid address: {}", recipient)))?
+            .require_network(self.network)
+            .map_err(|addr| FrostWalletError::InvalidState(
                 format!("Address network mismatch: got {:?}, expected {:?}",
-                        recipient_address.network(), self.network)
-            ));
-        }
+                        addr, self.network)
+            ))?;
 
         // Get confirmed UTXOs
         let confirmed_utxos: Vec<&WalletUtxo> = self.utxos.iter()
@@ -277,13 +277,15 @@ impl BitcoinFrostWallet {
         // Create transaction inputs
         let inputs: Vec<TxIn> = selected_utxos.iter()
             .map(|utxo| {
-                let txid = bitcoin::Txid::from_hex(&utxo.txid).unwrap();
+                // Fix: Use Txid::from_str instead of from_hex
+                let txid = Txid::from_str(&utxo.txid)
+                    .expect("Invalid txid format");
                 let outpoint = OutPoint::new(txid, utxo.vout);
                 TxIn {
                     previous_output: outpoint,
-                    script_sig: Script::new(),
-                    sequence: 0xFFFFFFFF,
-                    witness: vec![],
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence(0xFFFFFFFF),
+                    witness: Witness::new(),
                 }
             })
             .collect();
@@ -293,7 +295,7 @@ impl BitcoinFrostWallet {
 
         // Payment output
         outputs.push(TxOut {
-            value: amount,
+            value: Amount::from_sat(amount),
             script_pubkey: recipient_address.script_pubkey(),
         });
 
@@ -302,7 +304,7 @@ impl BitcoinFrostWallet {
         if change_amount > 0 {
             let change_address = self.get_address()?;
             outputs.push(TxOut {
-                value: change_amount,
+                value: Amount::from_sat(change_amount),  // Fix: Use Amount::from_sat
                 script_pubkey: change_address.script_pubkey(),
             });
         }
@@ -310,7 +312,7 @@ impl BitcoinFrostWallet {
         // Create transaction
         let tx = Transaction {
             version: transaction::Version(2),
-            lock_time: 0,
+            lock_time: LockTime::ZERO,
             input: inputs,
             output: outputs,
         };
