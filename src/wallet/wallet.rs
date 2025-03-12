@@ -6,10 +6,11 @@ use crate::frost_dkg::frost::FrostCoordinator;
 use crate::frost_dkg::signing_process::SigningProcessController;
 
 use bitcoin::{
-    Address, Network, ScriptBuf, Transaction, TxIn, TxOut, OutPoint,
-    consensus::encode::serialize_hex, sighash::TapSighash, Amount, hashes::Hash,
-    psbt::Psbt, secp256k1::{Secp256k1, XOnlyPublicKey, Message},
-    Txid, transaction, Sequence, Witness
+    Address, Network, ScriptBuf, Transaction,
+    TxIn, TxOut, OutPoint, consensus::encode::serialize_hex,
+    sighash::TapSighash, Amount, hashes::Hash, psbt::Psbt,
+    secp256k1::{Secp256k1, XOnlyPublicKey, Message}, Txid,
+    transaction, Sequence, Witness, TapSighashType
 };
 use frost_secp256k1::{
     Identifier, Signature,
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode;
 use tokio::sync::Mutex;
+use crate::rpc::rpc::{BitcoinRpcClient, Utxo};
 
 /// Bitcoin FROST Wallet implementation
 pub struct BitcoinFrostWallet {
@@ -48,6 +50,8 @@ pub struct BitcoinFrostWallet {
     dkg_controller: Option<DkgProcessController>,
     /// Signing process controller
     signing_controller: Option<SigningProcessController>,
+    /// Bitcoin RPC client
+    rpc_client: Option<Arc<dyn BitcoinRpcClient>>,
 }
 
 /// UTXO representation for the wallet
@@ -117,7 +121,13 @@ impl BitcoinFrostWallet {
             transactions: Vec::new(),
             dkg_controller: None,
             signing_controller: None,
+            rpc_client: None,
         }
+    }
+
+    /// Connect to Bitcoin node using RPC
+    pub fn connect_to_node(&mut self, rpc_client: Arc<dyn BitcoinRpcClient>) {
+        self.rpc_client = Some(rpc_client);
     }
 
     /// Initialize the wallet
@@ -133,6 +143,14 @@ impl BitcoinFrostWallet {
             Ok(_) => {
                 // Wallet state loaded successfully
                 log::info!("Wallet state loaded successfully");
+
+                // If we have an RPC client and a wallet address, register it with the node
+                if let (Some(rpc_client), Ok(address)) = (&self.rpc_client, self.get_address()) {
+                    log::info!("Registering wallet address with Bitcoin node: {}", address);
+                    let address_str = address.to_string();
+                    rpc_client.import_address(&address_str, Some("frost-wallet"), false).await?;
+                }
+
                 return Ok(());
             },
             Err(e) => {
@@ -183,6 +201,14 @@ impl BitcoinFrostWallet {
         // Store controller for later use
         self.dkg_controller = Some(controller);
 
+        // If we have an RPC client, register the wallet address with the Bitcoin node
+        if let Some(rpc_client) = &self.rpc_client {
+            let address = self.get_address()?;
+            log::info!("Registering wallet address with Bitcoin node: {}", address);
+            let address_str = address.to_string();
+            rpc_client.import_address(&address_str, Some("frost-wallet"), false).await?;
+        }
+
         Ok(())
     }
 
@@ -211,9 +237,57 @@ impl BitcoinFrostWallet {
         Ok(address)
     }
 
+    /// Sync wallet UTXOs from the Bitcoin node
+    pub async fn sync_utxos(&mut self) -> Result<()> {
+        // Ensure we have an RPC client
+        let rpc_client = self.rpc_client.as_ref()
+            .ok_or_else(|| FrostWalletError::ConnectionError("Not connected to Bitcoin node".to_string()))?;
+
+        // Get our wallet address
+        let address = self.get_address()?;
+        let address_str = address.to_string();
+
+        // Get UTXOs from the Bitcoin node
+        let utxos = rpc_client.get_utxos(Some(1), None).await?;
+
+        // Filter to only include UTXOs for our address
+        let our_utxos: Vec<Utxo> = utxos.into_iter()
+            .filter(|utxo| utxo.address == address_str)
+            .collect();
+
+        // Clear existing UTXOs and add the new ones
+        self.utxos.clear();
+
+        for utxo in our_utxos {
+            let script_pubkey_bytes = hex::decode(&utxo.script_pub_key)
+                .map_err(|e| FrostWalletError::SerializationError(format!("Failed to decode script_pub_key: {}", e)))?;
+
+            self.utxos.push(WalletUtxo {
+                txid: utxo.txid.clone(),
+                vout: utxo.vout,
+                amount: utxo.amount.to_sat(),
+                script_pubkey: script_pubkey_bytes,
+                confirmed: utxo.confirmations > 0,
+                block_height: if utxo.confirmations > 0 {
+                    // We could get the exact block height from the RPC client, but for simplicity we'll use None
+                    None
+                } else {
+                    None
+                },
+            });
+        }
+
+        // Save wallet state
+        self.save_state()?;
+
+        log::info!("Synced {} UTXOs from Bitcoin node", self.utxos.len());
+
+        Ok(())
+    }
+
     /// Create a Bitcoin transaction
-    pub fn create_transaction(
-        &self,
+    pub async fn create_transaction(
+        &mut self,
         recipient: &str,
         amount: u64,
         fee_rate: f64
@@ -221,6 +295,11 @@ impl BitcoinFrostWallet {
         // Check if wallet is initialized
         if self.key_package.is_none() || self.pub_key_package.is_none() {
             return Err(FrostWalletError::InvalidState("Wallet not initialized".to_string()));
+        }
+
+        // Sync UTXOs first to ensure we have the latest state
+        if let Some(rpc_client) = &self.rpc_client {
+            self.sync_utxos().await?;
         }
 
         // Parse recipient address and make sure it's for the correct network
@@ -254,7 +333,7 @@ impl BitcoinFrostWallet {
 
         // Check if we have enough funds
         if total_available < amount + fee {
-            return Err(FrostWalletError::InvalidState(
+            return Err(FrostWalletError::InsufficientFunds(
                 format!("Insufficient funds: have {}, need {}",
                         Amount::from_sat(total_available),
                         Amount::from_sat(amount + fee))
@@ -277,7 +356,6 @@ impl BitcoinFrostWallet {
         // Create transaction inputs
         let inputs: Vec<TxIn> = selected_utxos.iter()
             .map(|utxo| {
-                // Fix: Use Txid::from_str instead of from_hex
                 let txid = Txid::from_str(&utxo.txid)
                     .expect("Invalid txid format");
                 let outpoint = OutPoint::new(txid, utxo.vout);
@@ -304,7 +382,7 @@ impl BitcoinFrostWallet {
         if change_amount > 0 {
             let change_address = self.get_address()?;
             outputs.push(TxOut {
-                value: Amount::from_sat(change_amount),  // Fix: Use Amount::from_sat
+                value: Amount::from_sat(change_amount),
                 script_pubkey: change_address.script_pubkey(),
             });
         }
@@ -317,10 +395,26 @@ impl BitcoinFrostWallet {
             output: outputs,
         };
 
+        // Add transaction to history (as unsigned)
+        let tx_hex = encode::serialize_hex(&tx);
+        let wallet_tx = WalletTransaction {
+            txid: tx.txid().to_string(),
+            raw_tx: tx_hex,
+            amount: -(amount as i64), // Negative for outgoing
+            fee: fee,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            confirmed: false,
+            block_height: None,
+        };
+        self.add_transaction(wallet_tx)?;
+
         Ok(tx)
     }
 
-    /// Sign a transaction
+    /// Sign a transaction using FROST
     pub async fn sign_transaction(
         &mut self,
         tx: &Transaction,
@@ -352,6 +446,8 @@ impl BitcoinFrostWallet {
                 format!("Failed to create PSBT: {}", e)))?;
 
         // For each input, we need to sign it
+        let mut signed_tx = tx.clone();
+
         for (input_index, input) in tx.input.iter().enumerate() {
             // Find the UTXO being spent
             let utxo = self.utxos.iter()
@@ -362,54 +458,128 @@ impl BitcoinFrostWallet {
                 .ok_or_else(|| FrostWalletError::InvalidState(
                     format!("UTXO not found: {}:{}", input.previous_output.txid, input.previous_output.vout)))?;
 
-            // In a real implementation, we would properly handle the sighash creation
-            // For simplicity, let's just use a hash of the transaction as the message to sign
-            let tx_bytes = encode::serialize(tx);
-            let message = tx_bytes.to_vec();
+            // Create script from script_pubkey
+            let script = ScriptBuf::from_bytes(utxo.script_pubkey.clone());
+
+            // Add witness UTXO to PSBT
+            psbt.inputs[input_index].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(utxo.amount),
+                script_pubkey: script.clone(),
+            });
+
+            // For Taproot inputs, we need to create a TapSighash
+            let tap_sighash = TapSighash::from_signature_hash(
+                psbt.unsigned_tx.sighash_taproot(
+                    input_index,
+                    &[&script], // prevouts
+                    TapSighashType::Default
+                )
+            );
+
+            // Convert the sighash to bytes for signing
+            let sighash_bytes = tap_sighash.to_byte_array();
 
             // Sign the message with FROST
-            let frost_signature = controller.sign_message(message, signers.clone()).await?;
+            let frost_signature = controller.sign_message(sighash_bytes.to_vec(), signers.clone()).await?;
+
 
             // Convert FROST signature to Bitcoin signature format
             // Note: This is a simplified version - in a real implementation we would need
             // proper signature format conversion
             let signature_bytes = frost_signature.serialize().unwrap();
 
-            // For a proper implementation, we would need to handle the signature insertion
-            // into the PSBT correctly based on the input type (p2pkh, p2sh, p2wpkh, p2tr, etc.)
-            // This is a simplified example that won't actually work with real Bitcoin transactions
-            // because we're not handling the signature and sighash properly
+            // Create a Schnorr signature for the input
+            let secp = Secp256k1::verification_only();
+            let schnorr_sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&signature_bytes)
+                .map_err(|e| FrostWalletError::BitcoinError(format!("Invalid Schnorr signature: {}", e)))?;
+
+            // Add the signature to the witness
+            let mut witness = Witness::new();
+            witness.push(schnorr_sig.as_ref().to_vec());
+            signed_tx.input[input_index].witness = witness;
         }
 
-        // In a real implementation, we would finalize the PSBT properly
-        // For now, just return the original transaction as a placeholder
-        Ok(tx.clone())
+        // Update transaction in history (as signed)
+        let tx_hex = encode::serialize_hex(&signed_tx);
+
+        if let Some(tx_entry) = self.transactions.iter_mut()
+            .find(|t| t.txid == signed_tx.txid().to_string()) {
+            tx_entry.raw_tx = tx_hex;
+        } else {
+            // Add as new transaction if not found
+            let wallet_tx = WalletTransaction {
+                txid: signed_tx.txid().to_string(),
+                raw_tx: tx_hex,
+                amount: 0, // Will be updated after broadcast
+                fee: 0,    // Will be updated after broadcast
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                confirmed: false,
+                block_height: None,
+            };
+            self.add_transaction(wallet_tx)?;
+        }
+
+        // Save wallet state
+        self.save_state()?;
+        Ok(signed_tx)
     }
 
     /// Broadcast a transaction to the Bitcoin network
-    /// Note: this is a placeholder and would need to connect to a Bitcoin node
-    pub async fn broadcast_transaction(&self, tx: &Transaction) -> Result<String> {
-        // In a real implementation, you would connect to a Bitcoin node
-        // and broadcast the transaction using its RPC interface.
-        // For now, we'll just return the transaction ID.
+    pub async fn broadcast_transaction(&mut self, tx: &Transaction) -> Result<String> {
+        // Ensure we have an RPC client
+        let rpc_client = self.rpc_client.as_ref()
+            .ok_or_else(|| FrostWalletError::ConnectionError("Not connected to Bitcoin node".to_string()))?;
 
-        let txid = tx.txid().to_string();
-        log::info!("Broadcasting transaction: {}", txid);
+        // Serialize the transaction
+        let tx_hex = encode::serialize_hex(tx);
 
-        // In a real implementation:
-        // 1. Serialize the transaction
-        let tx_bytes = encode::serialize(tx);
-        let tx_hex = hex::encode(tx_bytes);
+        // Send to Bitcoin node
+        log::info!("Broadcasting transaction: {}", tx.txid());
+        let txid = rpc_client.send_raw_transaction(&tx_hex).await?;
 
-        // 2. Send to Bitcoin node
-        // bitcoind_client.sendrawtransaction(tx_hex)
+        // Update transaction in history as broadcasted
+        if let Some(tx_entry) = self.transactions.iter_mut()
+            .find(|t| t.txid == txid.to_string()) {
+            tx_entry.raw_tx = tx_hex;
+        } else {
+            // Should not happen, but add as new transaction if not found
+            let wallet_tx = WalletTransaction {
+                txid: txid.to_string(),
+                raw_tx: tx_hex,
+                amount: 0, // Will be updated after confirmation
+                fee: 0,    // Will be updated after confirmation
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                confirmed: false,
+                block_height: None,
+            };
+            self.add_transaction(wallet_tx)?;
+        }
 
-        // 3. Return the transaction ID
-        Ok(txid)
+        // Remove spent UTXOs
+        for input in &tx.input {
+            let txid_str = input.previous_output.txid.to_string();
+            self.remove_utxo(&txid_str, input.previous_output.vout)?;
+        }
+
+        // Save wallet state
+        self.save_state()?;
+
+        Ok(txid.to_string())
     }
 
     /// Get wallet balance
-    pub fn get_balance(&self) -> WalletBalance {
+    pub async fn get_balance(&mut self) -> Result<WalletBalance> {
+        // If connected to a node, sync UTXOs first
+        if self.rpc_client.is_some() {
+            self.sync_utxos().await?;
+        }
+
         let confirmed: u64 = self.utxos.iter()
             .filter(|utxo| utxo.confirmed)
             .map(|utxo| utxo.amount)
@@ -420,11 +590,11 @@ impl BitcoinFrostWallet {
             .map(|utxo| utxo.amount)
             .sum();
 
-        WalletBalance {
+        Ok(WalletBalance {
             confirmed,
             unconfirmed,
             total: confirmed + unconfirmed,
-        }
+        })
     }
 
     /// Add a UTXO to the wallet
