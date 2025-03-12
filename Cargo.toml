@@ -15,10 +15,11 @@ rand_core = { version = "0.6.4"}
 # Bitcoin dependencies
 bitcoin = { version = "0.31", features = ["rand", "serde"] }
 secp256k1 = { version = "0.27", features = ["rand-std"] }
+bitcoincore-rpc = "0.19.0"
 
 # Multi-processing & async
 tokio = { version = "1.32", features = ["full", "process", "sync", "io-util"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
 # Cap'n Proto for IPC
 capnp = "0.20.4"
@@ -42,6 +43,10 @@ indicatif = "0.17"
 
 # Path and filesystem
 dirs = "5.0"
+async-trait = "0.1.87"
+futures-util = "0.3.31"
+reqwest = { version = "0.12.12", features = ["json"] }
+base64 = "0.13.1"
 
 [build-dependencies]
 capnpc = "0.20.1"
