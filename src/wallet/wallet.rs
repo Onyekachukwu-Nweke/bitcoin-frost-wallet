@@ -25,6 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode;
+use bitcoin::sighash::{Prevouts, SighashCache};
 use tokio::sync::Mutex;
 use crate::rpc::rpc::{BitcoinRpcClient, Utxo};
 
@@ -445,6 +446,24 @@ impl BitcoinFrostWallet {
             .map_err(|e| FrostWalletError::InvalidState(
                 format!("Failed to create PSBT: {}", e)))?;
 
+        // Collect all previous outputs (UTXOs) for Prevouts
+        let mut prevouts = Vec::new();
+        for input in tx.input.iter() {
+            let utxo = self.utxos.iter()
+                .find(|u| {
+                    let txid = Txid::from_str(&u.txid).expect("Invalid txid format");
+                    txid == input.previous_output.txid && u.vout == input.previous_output.vout
+                })
+                .ok_or_else(|| FrostWalletError::InvalidState(
+                    format!("UTXO not found: {}:{}", input.previous_output.txid, input.previous_output.vout)))?;
+
+            prevouts.push(TxOut {
+                value: Amount::from_sat(utxo.amount),
+                script_pubkey: ScriptBuf::from_bytes(utxo.script_pubkey.clone()),
+            });
+        }
+        let prevouts = Prevouts::All(&prevouts);
+
         // For each input, we need to sign it
         let mut signed_tx = tx.clone();
 
@@ -467,25 +486,21 @@ impl BitcoinFrostWallet {
                 script_pubkey: script.clone(),
             });
 
+            // Create a SighashCache for the transaction
+            let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+
             // For Taproot inputs, we need to create a TapSighash
-            let tap_sighash = TapSighash::from_signature_hash(
-                psbt.unsigned_tx.sighash_taproot(
-                    input_index,
-                    &[&script], // prevouts
-                    TapSighashType::Default
-                )
-            );
+            let sighash = sighash_cache
+                .taproot_key_spend_signature_hash(input_index, &prevouts, TapSighashType::Default)
+                .map_err(|e| FrostWalletError::BitcoinError(format!("Failed to compute Taproot sighash: {}", e)))?;
 
             // Convert the sighash to bytes for signing
-            let sighash_bytes = tap_sighash.to_byte_array();
+            let sighash_bytes = sighash.as_byte_array().to_vec();
 
             // Sign the message with FROST
             let frost_signature = controller.sign_message(sighash_bytes.to_vec(), signers.clone()).await?;
 
-
             // Convert FROST signature to Bitcoin signature format
-            // Note: This is a simplified version - in a real implementation we would need
-            // proper signature format conversion
             let signature_bytes = frost_signature.serialize().unwrap();
 
             // Create a Schnorr signature for the input
