@@ -212,6 +212,7 @@ impl SigningProcessController {
         let timeout_duration = Duration::from_secs(SIGNING_TIMEOUT_SECONDS);
 
         while commitments_map.len() < signers.len() {
+            // println!("Waiting for commitments from other participants");
             if start_time.elapsed() > timeout_duration {
                 return Err(FrostWalletError::TimeoutError(
                     "Timed out waiting for commitments".to_string()

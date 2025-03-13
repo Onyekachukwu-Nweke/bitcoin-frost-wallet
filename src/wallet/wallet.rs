@@ -452,6 +452,8 @@ impl BitcoinFrostWallet {
 
         let controller = self.signing_controller.as_mut().unwrap();
 
+        println!("hjello pretty");
+
         // Create a PSBT for this transaction
         let mut psbt = Psbt::from_unsigned_tx(tx.clone())
             .map_err(|e| FrostWalletError::InvalidState(
@@ -508,6 +510,8 @@ impl BitcoinFrostWallet {
             // Convert the sighash to bytes for signing
             let sighash_bytes = sighash.as_byte_array().to_vec();
 
+            println!("Signers {:?}", signers);
+
             // Sign the message with FROST
             let frost_signature = controller.sign_message(sighash_bytes.to_vec(), signers.clone()).await?;
 
@@ -526,7 +530,7 @@ impl BitcoinFrostWallet {
         }
 
         // Update transaction in history (as signed)
-        let tx_hex = encode::serialize_hex(&signed_tx);
+        let tx_hex = serialize_hex(&signed_tx);
 
         if let Some(tx_entry) = self.transactions.iter_mut()
             .find(|t| t.txid == signed_tx.txid().to_string()) {
@@ -547,6 +551,8 @@ impl BitcoinFrostWallet {
             };
             self.add_transaction(wallet_tx)?;
         }
+
+        println!("hjello prettier");
 
         // Save wallet state
         self.save_state()?;
@@ -843,7 +849,7 @@ mod tests {
             binary_path.clone()
         );
 
-        // Start DKG IPC servers
+        // Start DKG IPC server
         dkg_local.start_server(&dkg_local_socket).await?;
         dkg_remote1.start_server(&dkg_remote1_socket).await?;
         dkg_remote2.start_server(&dkg_remote2_socket).await?;
@@ -903,7 +909,7 @@ mod tests {
         let mut rpc_client = MockBitcoinRpcClient::new(Network::Regtest);
 
         // Add UTXO to wallet
-        let utxo = crate::rpc::rpc::Utxo {
+        let utxo = Utxo {
             txid: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
             vout: 0,
             address: address.to_string(),
@@ -951,14 +957,12 @@ mod tests {
         // to the wallet's signing controller
         if let Some(controller) = &mut wallet.signing_controller {
             for &id in &participant_ids {
-                // if id != local_id {
-                    let participant = Participant::with_key_package(
-                        id,
-                        key_packages[&id].clone()
-                    );
-                    // println!("Hell");
-                    controller.coordinator.add_participant(participant);
-                // }
+                let participant = Participant::with_key_package(
+                    id,
+                    key_packages[&id].clone()
+                );
+
+                controller.coordinator.add_participant(participant);
             }
         }
 

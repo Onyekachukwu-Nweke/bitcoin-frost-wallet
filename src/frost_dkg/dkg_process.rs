@@ -527,7 +527,6 @@ impl DkgParticipantProcess {
 
 #[cfg(test)]
 mod tests {
-    use frost_core::keys::dkg::round2;
     use super::*;
     use tempfile::tempdir;
 
