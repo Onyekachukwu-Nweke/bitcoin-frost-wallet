@@ -251,6 +251,7 @@ impl DkgProcessController {
         sender_id: Identifier,
         message: IpcMessage,
     ) -> Result<()> {
+        println!("Message from participant {:?}: {:?}", sender_id, message);
         match message {
             IpcMessage::Dkg(dkg_message) => {
                 match dkg_message {

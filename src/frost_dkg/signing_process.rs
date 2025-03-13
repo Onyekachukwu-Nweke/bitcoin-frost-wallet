@@ -24,7 +24,7 @@ pub struct SigningProcessController {
     /// Threshold configuration
     config: ThresholdConfig,
     /// FROST coordinator
-    coordinator: FrostCoordinator,
+    pub(crate) coordinator: FrostCoordinator,
     /// Process coordinator
     processes: ProcessCoordinator,
     /// IPC server
