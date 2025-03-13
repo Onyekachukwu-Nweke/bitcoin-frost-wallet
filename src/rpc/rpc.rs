@@ -294,6 +294,7 @@ impl BitcoinRpcClient for BitcoinRpcClientImpl {
 
 /// Mock implementation of Bitcoin RPC client for testing
 #[cfg(test)]
+#[derive(Clone)]
 pub struct MockBitcoinRpcClient {
     network: Network,
     utxos: Vec<Utxo>,
