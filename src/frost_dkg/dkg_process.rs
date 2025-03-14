@@ -103,6 +103,54 @@ impl DkgProcessController {
         let local_participant = Participant::new(self.local_id);
         self.coordinator.add_participant(local_participant)?;
 
+        // Before starting DKG, wait until all handshakes have been received
+        // This ensures we have all participants connected
+        let expected_participants = self.config.total_participants;
+        let mut participant_count = 1; // Start with 1 (the coordinator)
+        let start_time = Instant::now();
+        let timeout_duration = Duration::from_secs(DKG_TIMEOUT_SECONDS);
+
+        while participant_count < expected_participants {
+            if start_time.elapsed() > timeout_duration {
+                return Err(FrostWalletError::TimeoutError(
+                    format!("Timed out waiting for participants to connect. Have {}, need {}",
+                            participant_count, expected_participants)
+                ));
+            }
+
+            // Process any incoming messages to handle handshakes
+            if let Some(server) = &mut self.ipc_server {
+                match timeout(Duration::from_millis(100), server.receive()).await {
+                    Ok(Ok((sender_id, message))) => {
+                        match message {
+                            IpcMessage::Handshake(id) => {
+                                log::info!("Received handshake from participant: {:?}", id);
+                                // Add participant if not already present
+                                let participant = Participant::new(id);
+                                if self.coordinator.add_participant(participant).is_ok() {
+                                    participant_count += 1;
+                                    log::info!("Added participant {:?}, now have {}/{}",
+                                    id, participant_count, expected_participants);
+                                }
+                            },
+                            _ => {
+                                // Handle other message types
+                                self.handle_dkg_message(sender_id, message).await?;
+                            }
+                        }
+                    },
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {}, // Timeout, continue waiting
+                }
+            }
+
+            // Short sleep to avoid busy waiting
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        log::info!("All {} participants connected, starting DKG", participant_count);
+
+
         // Start DKG with all remote participants
         self.broadcast_message(IpcMessage::Dkg(DkgMessage::Start(self.config.clone()))).await?;
 
@@ -251,6 +299,15 @@ impl DkgProcessController {
         sender_id: Identifier,
         message: IpcMessage,
     ) -> Result<()> {
+        log::debug!("Received message from {:?}, message type: {:?}",
+            sender_id,
+            match &message {
+                IpcMessage::Dkg(d) => format!("DkgMessage::{:?}", d),
+                IpcMessage::Handshake(_) => "Handshake".to_string(),
+                _ => format!("{:?}", message)
+            }
+        );
+
         match message {
             IpcMessage::Dkg(dkg_message) => {
                 match dkg_message {
@@ -292,6 +349,19 @@ impl DkgProcessController {
                         // Nothing to do, we'll detect completion from state
                     },
                 }
+            },
+            IpcMessage::Handshake(id) => {
+                // Handle the handshake message by registering the participant
+                log::info!("Received handshake from participant: {:?}", id);
+
+                // We could add the participant here, but it's better to wait for the
+                // Start message which includes the threshold config for validation
+                // Add participant
+                let participant = Participant::new(id);
+                let _ = self.coordinator.add_participant(participant);
+
+                // No need to do anything else for handshake messages
+                return Ok(());
             },
             _ => {
                 return Err(FrostWalletError::DkgError(
@@ -346,6 +416,8 @@ pub struct DkgParticipantProcess {
     client: Option<IpcClient>,
     /// Received key package
     key_package: Option<KeyPackage>,
+    /// IPC server for incoming connections
+    ipc_server: Option<IpcServer>,
 }
 
 impl DkgParticipantProcess {
@@ -359,7 +431,16 @@ impl DkgParticipantProcess {
             coordinator,
             client: None,
             key_package: None,
+            ipc_server: None,
         }
+    }
+
+    /// Start the IPC server
+    pub async fn start_server(&mut self, socket_path: impl AsRef<Path>) -> Result<()> {
+        let server = IpcServer::new(self.local_id, socket_path).await?;
+        server.start().await?;
+        self.ipc_server = Some(server);
+        Ok(())
     }
 
     /// Connect to the coordinator
@@ -372,6 +453,7 @@ impl DkgParticipantProcess {
     }
 
     /// Run the DKG protocol as a participant
+    /// Run the DKG protocol as a participant
     pub async fn run(&mut self) -> Result<KeyPackage> {
         // Verify we have a connection to the coordinator
         let client = self.client.as_mut()
@@ -382,29 +464,51 @@ impl DkgParticipantProcess {
 
         log::info!("Starting DKG as participant {:?}", self.local_id);
 
+        // Send handshake to coordinator first
+        client.send(IpcMessage::Handshake(self.local_id)).await?;
+
+        // Give the coordinator some time to process the handshake
+        sleep(Duration::from_millis(500)).await;
+
         // Wait for coordinator to start DKG
-        loop {
+        let start_time = Instant::now();
+        let timeout_duration = Duration::from_secs(DKG_TIMEOUT_SECONDS);
+
+        while !received_config {
+            if start_time.elapsed() > timeout_duration {
+                return Err(FrostWalletError::TimeoutError("Timed out waiting for DKG start".to_string()));
+            }
+
             // Receive a message from the coordinator
-            let message = client.receive().await?;
+            match timeout(Duration::from_secs(5), client.receive()).await {
+                Ok(Ok(message)) => {
+                    match message {
+                        IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                            log::info!("Received DKG start: {:?}", config);
 
-            match message {
-                IpcMessage::Dkg(DkgMessage::Start(config)) => {
-                    log::info!("Received DKG start: {:?}", config);
+                            // Initialize coordinator with the received config
+                            self.coordinator = DkgCoordinator::new(config.clone());
 
-                    // Initialize coordinator with the received config
-                    self.coordinator = DkgCoordinator::new(config.clone());
+                            // Add ourselves as a participant
+                            let participant = Participant::new(self.local_id);
+                            self.coordinator.add_participant(participant)?;
 
-                    // Add ourselves as a participant
-                    let participant = Participant::new(self.local_id);
-                    self.coordinator.add_participant(participant)?;
-
-                    // Start the DKG process
-                    self.coordinator.start()?;
-                    received_config = true;
-                    break;
+                            // Start the DKG process
+                            self.coordinator.start()?;
+                            received_config = true;
+                            break;
+                        },
+                        _ => {
+                            // Ignore other messages until we receive the DKG start
+                            log::debug!("Ignoring message while waiting for DKG start: {:?}", message);
+                            continue;
+                        }
+                    }
                 },
-                _ => {
-                    // Ignore other messages until we receive the DKG start
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Timeout, continue waiting
+                    log::debug!("Timeout waiting for message, continuing to wait...");
                     continue;
                 }
             }
@@ -431,19 +535,21 @@ impl DkgParticipantProcess {
         let start_time = Instant::now();
 
         while start_time.elapsed() < timeout_duration {
-            match timeout(Duration::from_millis(200), client.receive()).await {
+            match timeout(Duration::from_millis(500), client.receive()).await {
                 Ok(Ok(message)) => {
                     match message {
                         IpcMessage::Dkg(dkg_message) => {
                             match dkg_message {
                                 DkgMessage::Commitment(participant_id, commitment_data) => {
                                     // Process commitment if we're in Round 1
+                                    log::debug!("Received commitment from participant {:?}", participant_id);
                                     let round1_package = bincode::deserialize(&commitment_data)?;
                                     self.coordinator.process_round1_package(participant_id, round1_package)?;
                                 },
                                 DkgMessage::KeyShare(from_id, to_id, key_share_data) => {
                                     // Process key share if it's for us
                                     if to_id == self.local_id {
+                                        log::debug!("Received key share from participant {:?}", from_id);
                                         // Deserialize key share data
                                         let round2_package = bincode::deserialize(&key_share_data)?;
 
@@ -458,12 +564,14 @@ impl DkgParticipantProcess {
                                         if matches!(self.coordinator.get_round_state(), DkgRoundState::Round2)
                                             && round_state != DkgRoundState::Round2 {
                                             round_state = DkgRoundState::Round2;
+                                            log::debug!("Advancing to Round 2");
 
                                             // Generate Round 2 packages
                                             let round2_packages = self.coordinator.generate_round2(self.local_id)?;
 
                                             // Send each package to the coordinator (it will forward to the right participant)
                                             for (recipient_id, package) in &round2_packages {
+                                                log::debug!("Sending key share to participant {:?}", recipient_id);
                                                 client.send(IpcMessage::Dkg(DkgMessage::KeyShare(
                                                     self.local_id,
                                                     *recipient_id,
@@ -475,7 +583,9 @@ impl DkgParticipantProcess {
                                 },
                                 DkgMessage::Finish => {
                                     // Finalize the DKG process if we have all data
+                                    log::debug!("Received DKG finish message");
                                     if matches!(self.coordinator.get_round_state(), DkgRoundState::Round3) {
+                                        log::info!("Finalizing DKG");
                                         let key_package = self.coordinator.finalize(self.local_id)?;
                                         self.key_package = Some(key_package.clone());
                                         return Ok(key_package);
@@ -483,11 +593,13 @@ impl DkgParticipantProcess {
                                 },
                                 _ => {
                                     // Ignore other DKG messages
+                                    log::debug!("Ignoring unexpected DKG message: {:?}", dkg_message);
                                 }
                             }
                         },
                         _ => {
                             // Ignore non-DKG messages
+                            log::debug!("Ignoring non-DKG message: {:?}", message);
                         }
                     }
                 },
@@ -498,16 +610,19 @@ impl DkgParticipantProcess {
                         DkgRoundState::Round3 if round_state != DkgRoundState::Round3 => {
                             // If we reached Round 3 but haven't yet finalized
                             round_state = DkgRoundState::Round3;
+                            log::info!("Advancing to Round 3");
                             let key_package = self.coordinator.finalize(self.local_id)?;
                             self.key_package = Some(key_package.clone());
 
                             // Send completion back to coordinator
                             client.send(IpcMessage::Dkg(DkgMessage::Finish)).await?;
+                            log::info!("Sent DKG finish message");
 
                             return Ok(key_package);
                         },
                         _ => {
                             // Continue waiting
+                            log::debug!("Waiting for messages, current state: {:?}", self.coordinator.get_round_state());
                         }
                     }
                 }
@@ -526,9 +641,122 @@ impl DkgParticipantProcess {
 
 #[cfg(test)]
 mod tests {
-    use frost_core::keys::dkg::round2;
     use super::*;
     use tempfile::tempdir;
+    use tokio::task;
+
+    /// Create socket paths for a test with n participants
+    pub fn create_socket_paths(dir: &Path, n: u16) -> Vec<PathBuf> {
+        (0..n).map(|i| dir.join(format!("participant_{}.sock", i))).collect()
+    }
+
+    /// Create test participants with unique IDs starting from 1
+    pub fn create_test_participants(count: u16) -> Vec<Identifier> {
+        (1..=count).map(|i| Identifier::try_from(i).unwrap()).collect()
+    }
+
+    /// Wait for a condition to become true with timeout
+    pub async fn wait_for_condition<F>(mut condition: F, timeout_ms: u64) -> Result<()>
+    where
+        F: FnMut() -> bool,
+    {
+        let start = Instant::now();
+        let timeout_duration = Duration::from_millis(timeout_ms);
+
+        while !condition() {
+            if start.elapsed() > timeout_duration {
+                return Err(FrostWalletError::TimeoutError("Condition timed out".to_string()));
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(())
+    }
+
+    /// Basic multi-process DKG test
+    /// Basic multi-process DKG test
+    #[tokio::test]
+    async fn test_multiprocess_dkg_basic() -> Result<()> {
+        // Setup test environment
+        let dir = tempdir().unwrap();
+        let socket_paths = create_socket_paths(dir.path(), 3); // 3 participants
+        let participants = create_test_participants(3);
+        let binary_path = PathBuf::from("target/debug/bitcoin-frost-wallet");
+        let config = ThresholdConfig::new(2, 3); // 2-of-3
+
+        // Create coordinator (participant 1)
+        let coordinator_id = participants[0];
+        let mut controller = DkgProcessController::new(
+            coordinator_id,
+            config.clone(),
+            binary_path.clone(),
+        );
+
+        // Start coordinator's IPC server
+        controller.start_server(&socket_paths[0]).await?;
+
+        // Create participant processes
+        let mut participant2 = DkgParticipantProcess::new(participants[1]);
+        let mut participant3 = DkgParticipantProcess::new(participants[2]);
+
+        // Start participant IPC servers
+        participant2.start_server(&socket_paths[1]).await?;
+        participant3.start_server(&socket_paths[2]).await?;
+
+        // Connect participants to coordinator
+        participant2.connect_to_coordinator(&socket_paths[0]).await?;
+        participant3.connect_to_coordinator(&socket_paths[0]).await?;
+
+        // Connect coordinator to participants
+        controller.connect_to_participant(participants[1], &socket_paths[1]).await?;
+        controller.connect_to_participant(participants[2], &socket_paths[2]).await?;
+
+        // Wait a bit to ensure all connections are established
+        sleep(Duration::from_millis(500)).await;
+
+        // Add coordinator as a participant first
+        let coordinator_participant = Participant::new(coordinator_id);
+        controller.coordinator.add_participant(coordinator_participant)?;
+
+        // Run DKG in separate tasks
+        let coordinator_task = task::spawn(async move {
+            controller.run_dkg().await.unwrap()
+        });
+
+        let participant2_task = task::spawn(async move {
+            participant2.run().await.unwrap()
+        });
+
+        let participant3_task = task::spawn(async move {
+            participant3.run().await.unwrap()
+        });
+
+        // Wait for all tasks with extended timeout (2 minutes)
+        let coordinator_result = timeout(
+            Duration::from_secs(120),
+            coordinator_task
+        ).await.unwrap().unwrap();
+
+        let participant2_result = timeout(
+            Duration::from_secs(120),
+            participant2_task
+        ).await.unwrap().unwrap();
+
+        let participant3_result = timeout(
+            Duration::from_secs(120),
+            participant3_task
+        ).await.unwrap().unwrap();
+
+        // Verify all participants have consistent key packages
+        let coordinator_key = coordinator_result.verifying_key();
+        let participant2_key = participant2_result.verifying_key();
+        let participant3_key = participant3_result.verifying_key();
+
+        assert_eq!(coordinator_key, participant2_key);
+        assert_eq!(coordinator_key, participant3_key);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_dkg_single_process() {
@@ -713,5 +941,7 @@ mod tests {
             let _ = server.cleanup();
         }
     }
+
+
 }
 
