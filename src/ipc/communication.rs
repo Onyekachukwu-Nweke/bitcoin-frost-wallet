@@ -239,14 +239,19 @@ impl IpcClient {
             }
         });
 
+        // println!("Before Handshake");
+
         // Send initial handshake with our ID
         self.send(IpcMessage::Handshake(self.local_id)).await?;
+
+        // println!("After Handshake");
 
         Ok(())
     }
 
     /// Send a message
     pub async fn send(&self, message: IpcMessage) -> Result<()> {
+        println!("Sending message: {:?}", message);
         self.outgoing.send(message).await
             .map_err(|e| FrostWalletError::IpcError(format!("Failed to send message: {}", e)))
     }
