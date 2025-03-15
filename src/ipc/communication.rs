@@ -4,15 +4,12 @@ use crate::common::types::{DkgMessage, IpcMessage, SigningMessage};
 use crate::capnp_gen::{serialize_message, deserialize_message};
 use frost_secp256k1::Identifier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixListener;
+use tokio::net::{TcpStream, TcpListener};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::fs;
 
 /// Maximum message size in bytes (10MB)
 const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -45,12 +42,19 @@ impl<T> IpcChannel<T> {
     }
 }
 
-/// Unix socket-based IPC server
+
+/// TCP-based IPC server acting as the coordinator in ChillDKG
+///
+/// The server (coordinator) acts as a central message hub in ChillDKG:
+/// 1. All participants connect to the coordinator
+/// 2. The coordinator collects messages from participants
+/// 3. The coordinator routes/broadcasts messages to relevant participants
+/// 4. The coordinator helps manage the protocol flow across its rounds
 pub struct IpcServer {
     /// Local participant ID
     local_id: Identifier,
-    /// Socket path
-    socket_path: PathBuf,
+    /// Socket address
+    socket_addr: SocketAddr,
     /// Connected clients
     clients: Arc<Mutex<HashMap<Identifier, Sender<IpcMessage>>>>,
     /// Channel for incoming messages
@@ -59,24 +63,12 @@ pub struct IpcServer {
 
 impl IpcServer {
     /// Create a new IPC server
-    pub async fn new(local_id: Identifier, socket_path: impl AsRef<Path>) -> Result<Self> {
-        let socket_path = socket_path.as_ref().to_path_buf();
-
-        // Create parent directory if it doesn't exist
-        if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| FrostWalletError::IoError(e))?;
-        }
-
-        // Remove the socket file if it already exists
-        if socket_path.exists() {
-            fs::remove_file(&socket_path)
-                .map_err(|e| FrostWalletError::IoError(e))?;
-        }
+    pub async fn new(local_id: Identifier, ip: IpAddr, port: u16) -> Result<Self> {
+        let socket_addr = SocketAddr::new(ip, port);
 
         let server = Self {
             local_id,
-            socket_path,
+            socket_addr,
             clients: Arc::new(Mutex::new(HashMap::new())),
             incoming: IpcChannel::new(100),
         };
@@ -84,19 +76,16 @@ impl IpcServer {
         Ok(server)
     }
 
+    /// Create a new IPC server bound to localhost with the specified port
+    pub async fn new_localhost(local_id: Identifier, port: u16) -> Result<Self> {
+        Self::new(local_id, IpAddr::V4(Ipv4Addr::LOCALHOST), port).await
+    }
+
     /// Start listening for connections
     pub async fn start(&self) -> Result<()> {
-        let listener = UnixListener::bind(&self.socket_path)
-            .map_err(|e| FrostWalletError::IpcError(format!("Failed to bind to {:?}: {}", self.socket_path, e)))?;
-
-        // Set socket permissions (important for security)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600); // Only owner can read/write
-            fs::set_permissions(&self.socket_path, perms)
-                .map_err(|e| FrostWalletError::IoError(e))?;
-        }
+        let listener = TcpListener::bind(&self.socket_addr)
+            .await
+            .map_err(|e| FrostWalletError::IpcError(format!("Failed to bind to {}: {}", self.socket_addr, e)))?;
 
         let clients = self.clients.clone();
         let incoming_tx = self.incoming.sender();
@@ -105,8 +94,8 @@ impl IpcServer {
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
-                        log::info!("New connection on Unix socket");
+                    Ok((stream, addr)) => {
+                        log::info!("New TCP connection from {}", addr);
 
                         let clients = clients.clone();
                         let incoming_tx = incoming_tx.clone();
@@ -154,36 +143,61 @@ impl IpcServer {
         Ok(())
     }
 
+    /// Forward a message from one participant to another
+    pub async fn forward(&self, from_id: Identifier, to_id: Identifier, message: IpcMessage) -> Result<()> {
+        self.send(to_id, message).await
+    }
+
+    /// Broadcast a message to all participants except the sender
+    pub async fn broadcast_except(&self, sender_id: Identifier, message: IpcMessage) -> Result<()> {
+        let clients = self.clients.lock().await;
+
+        for (id, tx) in clients.iter() {
+            if *id != sender_id {
+                if let Err(e) = tx.send(message.clone()).await {
+                    log::error!("Failed to send to participant {:?}: {}", id, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Receive the next message
     pub async fn receive(&mut self) -> Result<(Identifier, IpcMessage)> {
         self.incoming.rx.recv().await
             .ok_or_else(|| FrostWalletError::IpcError("Channel closed".to_string()))
     }
 
-    /// Clean up socket file
-    pub fn cleanup(&self) -> Result<()> {
-        if self.socket_path.exists() {
-            fs::remove_file(&self.socket_path)
-                .map_err(|e| FrostWalletError::IoError(e))?;
-        }
-        Ok(())
+    /// Get the server's socket address
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+
+    /// Get a list of all connected participants
+    pub async fn connected_participants(&self) -> Vec<Identifier> {
+        let clients = self.clients.lock().await;
+        clients.keys().cloned().collect()
+    }
+
+    /// Check if a specific participant is connected
+    pub async fn is_participant_connected(&self, participant_id: Identifier) -> bool {
+        let clients = self.clients.lock().await;
+        clients.contains_key(&participant_id)
     }
 }
 
-impl Drop for IpcServer {
-    fn drop(&mut self) {
-        let _ = self.cleanup();
-    }
-}
-
-/// Unix socket-based IPC client
+/// TCP-based IPC client that connects to the coordinator
+///
+/// In ChillDKG, all participants act as clients that connect to the coordinator.
+/// Participants only communicate with the coordinator, not directly with each other.
 pub struct IpcClient {
     /// Local participant ID
     local_id: Identifier,
-    /// Remote participant ID
+    /// Remote participant ID (usually the coordinator's ID)
     remote_id: Identifier,
-    /// Unix stream
-    stream: Option<UnixStream>,
+    /// TCP stream
+    stream: Option<TcpStream>,
     /// Channel for outgoing messages
     outgoing: Sender<IpcMessage>,
     /// Channel for incoming messages
@@ -205,13 +219,16 @@ impl IpcClient {
         }
     }
 
-    /// Connect to a server
-    pub async fn connect(&mut self, socket_path: impl AsRef<Path>) -> Result<()> {
-        let stream = UnixStream::connect(socket_path)
+    /// Connect to the coordinator server
+    pub async fn connect(&mut self, addr: SocketAddr) -> Result<()> {
+        log::info!("Connecting to coordinator at {}", addr);
+        let stream = TcpStream::connect(addr)
             .await
-            .map_err(|e| FrostWalletError::IpcError(format!("Failed to connect to socket: {}", e)))?;
+            .map_err(|e| FrostWalletError::IpcError(format!("Failed to connect to coordinator at {}: {}", addr, e)))?;
 
-        // self.stream = Option::from(stream);
+        // Set TCP_NODELAY to disable Nagle's algorithm for better latency
+        stream.set_nodelay(true)
+            .map_err(|e| FrostWalletError::IpcError(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
         let (read_half, mut write_half) = stream.into_split();
 
@@ -245,10 +262,14 @@ impl IpcClient {
         Ok(())
     }
 
-    /// Send a message
+    /// Send a message to the coordinator
     pub async fn send(&self, message: IpcMessage) -> Result<()> {
         self.outgoing.send(message).await
-            .map_err(|e| FrostWalletError::IpcError(format!("Failed to send message: {}", e)))
+            .map_err(|e| FrostWalletError::IpcError(format!("Failed to send message to coordinator: {}", e)))
+    }
+
+    pub async fn send_to_participant(&self, participant_id: Identifier, message: IpcMessage) -> Result<()> {
+        self.send(message).await
     }
 
     /// Receive the next message
@@ -271,10 +292,14 @@ impl IpcClient {
 
 // Helper function to handle a new connection
 async fn handle_connection(
-    stream: UnixStream,
+    stream: TcpStream,
     clients: Arc<Mutex<HashMap<Identifier, Sender<IpcMessage>>>>,
     incoming_tx: Sender<(Identifier, IpcMessage)>,
 ) -> Result<()> {
+    // Set TCP_NODELAY to disable Nagle's algorithm for better latency
+    stream.set_nodelay(true)
+        .map_err(|e| FrostWalletError::IpcError(format!("Failed to set TCP_NODELAY: {}", e)))?;
+
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Create a channel for messages to send to this client
@@ -443,6 +468,7 @@ async fn write_message<W: AsyncWrite + Unpin, T: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use super::*;
     use crate::common::types::ThresholdConfig;
     use tempfile::tempdir;
@@ -470,22 +496,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unix_socket_communication() {
-        // Create a temporary directory for the socket
-        let dir = tempdir().unwrap();
-        let socket_path = dir.path().join("test.sock");
+    async fn test_tcp_communication() {
+        // Use a high port number to avoid conflicts
+        let port = 34567;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
         // Create server and client IDs
         let server_id = Identifier::try_from(1).unwrap();
         let client_id = Identifier::try_from(2).unwrap();
 
         // Create and start server
-        let mut server = IpcServer::new(server_id, &socket_path).await.unwrap();
+        let mut server = IpcServer::new_localhost(server_id, port).await.unwrap();
         server.start().await.unwrap();
 
         // Create and connect client
         let mut client = IpcClient::new(client_id, server_id);
-        client.connect(&socket_path).await.unwrap();
+        client.connect(server_addr).await.unwrap();
 
         // First, receive the handshake message that is automatically sent when connecting
         let (handshake_sender_id, handshake_message) = tokio::time::timeout(
@@ -511,9 +537,6 @@ mod tests {
             std::time::Duration::from_secs(1),
             server.receive()
         ).await.unwrap().unwrap();
-
-        println!("Sender ID: {:?}", sender_id);
-        println!("Received message: {:?}", received_message);
 
         // Verify the message
         assert_eq!(sender_id, client_id);
@@ -543,6 +566,258 @@ mod tests {
 
         // Clean up
         client.close().await.unwrap();
-        server.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_to_multiple_clients() {
+        // Use a high port number to avoid conflicts
+        let port = 34568;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Create server and client IDs
+        let server_id = Identifier::try_from(1).unwrap();
+        let client1_id = Identifier::try_from(2).unwrap();
+        let client2_id = Identifier::try_from(3).unwrap();
+        let client3_id = Identifier::try_from(4).unwrap();
+
+        // Create and start server
+        let mut server = IpcServer::new_localhost(server_id, port).await.unwrap();
+        server.start().await.unwrap();
+
+        // Create and connect multiple clients
+        let mut client1 = IpcClient::new(client1_id, server_id);
+        let mut client2 = IpcClient::new(client2_id, server_id);
+        let mut client3 = IpcClient::new(client3_id, server_id);
+
+        client1.connect(server_addr).await.unwrap();
+        client2.connect(server_addr).await.unwrap();
+        client3.connect(server_addr).await.unwrap();
+
+        // Consume all handshake messages
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.receive()
+            ).await.unwrap();
+        }
+
+        // Check connected participants
+        let connected = server.connected_participants().await;
+        assert_eq!(connected.len(), 3);
+        assert!(connected.contains(&client1_id));
+        assert!(connected.contains(&client2_id));
+        assert!(connected.contains(&client3_id));
+
+        // Test individual participant connection check
+        assert!(server.is_participant_connected(client1_id).await);
+        assert!(server.is_participant_connected(client2_id).await);
+        assert!(server.is_participant_connected(client3_id).await);
+
+        // Non-existent participant should not be connected
+        let non_existent_id = Identifier::try_from(99).unwrap();
+        assert!(!server.is_participant_connected(non_existent_id).await);
+
+        // Broadcast a message to all clients
+        let broadcast_message = IpcMessage::Dkg(DkgMessage::Start(ThresholdConfig::new(2, 3)));
+        server.broadcast(broadcast_message.clone()).await.unwrap();
+
+        // Verify all clients receive the broadcast
+        let received1 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client1.receive()
+        ).await.unwrap().unwrap();
+
+        let received2 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client2.receive()
+        ).await.unwrap().unwrap();
+
+        let received3 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client3.receive()
+        ).await.unwrap().unwrap();
+
+        // Verify all received messages match the broadcast
+        match received1 {
+            IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                assert_eq!(config.threshold, 2);
+                assert_eq!(config.total_participants, 3);
+            }
+            _ => panic!("Wrong message type received by client 1"),
+        }
+
+        match received2 {
+            IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                assert_eq!(config.threshold, 2);
+                assert_eq!(config.total_participants, 3);
+            }
+            _ => panic!("Wrong message type received by client 2"),
+        }
+
+        match received3 {
+            IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                assert_eq!(config.threshold, 2);
+                assert_eq!(config.total_participants, 3);
+            }
+            _ => panic!("Wrong message type received by client 3"),
+        }
+
+        // Clean up
+        client1.close().await.unwrap();
+        client2.close().await.unwrap();
+        client3.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_except_sender() {
+        // Use a high port number to avoid conflicts
+        let port = 34569;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Create server and client IDs
+        let server_id = Identifier::try_from(1).unwrap();
+        let client1_id = Identifier::try_from(2).unwrap();
+        let client2_id = Identifier::try_from(3).unwrap();
+        let client3_id = Identifier::try_from(4).unwrap();
+
+        // Create and start server
+        let mut server = IpcServer::new_localhost(server_id, port).await.unwrap();
+        server.start().await.unwrap();
+
+        // Create and connect multiple clients
+        let mut client1 = IpcClient::new(client1_id, server_id);
+        let mut client2 = IpcClient::new(client2_id, server_id);
+        let mut client3 = IpcClient::new(client3_id, server_id);
+
+        client1.connect(server_addr).await.unwrap();
+        client2.connect(server_addr).await.unwrap();
+        client3.connect(server_addr).await.unwrap();
+
+        // Consume all handshake messages
+        for _ in 0..3 {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.receive()
+            ).await.unwrap();
+        }
+
+        // Broadcast a message to all clients except client1
+        let broadcast_message = IpcMessage::Dkg(DkgMessage::Start(ThresholdConfig::new(2, 3)));
+        server.broadcast_except(client1_id, broadcast_message.clone()).await.unwrap();
+
+        // Set up timeouts for receiving - client1 should timeout, others should receive
+        let timeout_duration = Duration::from_millis(500);
+
+        // Client 1 should NOT receive the message (timeout)
+        let result1 = tokio::time::timeout(
+            timeout_duration,
+            client1.receive()
+        ).await;
+
+        // Client 2 and 3 should receive the message
+        let received2 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client2.receive()
+        ).await.unwrap().unwrap();
+
+        let received3 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client3.receive()
+        ).await.unwrap().unwrap();
+
+        // Client 1 should have timed out
+        assert!(result1.is_err(), "Client 1 should not have received the broadcast_except message");
+
+        // Verify other clients received the message
+        match received2 {
+            IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                assert_eq!(config.threshold, 2);
+                assert_eq!(config.total_participants, 3);
+            }
+            _ => panic!("Wrong message type received by client 2"),
+        }
+
+        match received3 {
+            IpcMessage::Dkg(DkgMessage::Start(config)) => {
+                assert_eq!(config.threshold, 2);
+                assert_eq!(config.total_participants, 3);
+            }
+            _ => panic!("Wrong message type received by client 3"),
+        }
+
+        // Clean up
+        client1.close().await.unwrap();
+        client2.close().await.unwrap();
+        client3.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_message_forwarding() {
+        // Use a high port number to avoid conflicts
+        let port = 34570;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Create server and client IDs
+        let server_id = Identifier::try_from(1).unwrap();
+        let client1_id = Identifier::try_from(2).unwrap();
+        let client2_id = Identifier::try_from(3).unwrap();
+
+        // Create and start server
+        let mut server = IpcServer::new_localhost(server_id, port).await.unwrap();
+        server.start().await.unwrap();
+
+        // Create and connect multiple clients
+        let mut client1 = IpcClient::new(client1_id, server_id);
+        let mut client2 = IpcClient::new(client2_id, server_id);
+
+        client1.connect(server_addr).await.unwrap();
+        client2.connect(server_addr).await.unwrap();
+
+        // Consume all handshake messages
+        for _ in 0..2 {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.receive()
+            ).await.unwrap();
+        }
+
+        // Client 1 sends a message intended for client 2
+        let message_to_forward = IpcMessage::Dkg(DkgMessage::KeyShare(
+            client1_id, client2_id, Vec::new()
+        ));
+
+        // Using the send_to_participant method (which in this implementation just sends to coordinator)
+        client1.send_to_participant(client2_id, message_to_forward.clone()).await.unwrap();
+
+        // Server receives the message
+        let (sender_id, received_message) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.receive()
+        ).await.unwrap().unwrap();
+
+        // Verify the sender
+        assert_eq!(sender_id, client1_id);
+
+        // Server forwards the message to client2
+        server.forward(client1_id, client2_id, received_message).await.unwrap();
+
+        // Client 2 receives the forwarded message
+        let forwarded_message = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client2.receive()
+        ).await.unwrap().unwrap();
+
+        // Verify the forwarded message
+        match forwarded_message {
+            IpcMessage::Dkg(DkgMessage::KeyShare(from_id, to_id, _)) => {
+                assert_eq!(from_id, client1_id);
+                assert_eq!(to_id, client2_id);
+            }
+            _ => panic!("Wrong message type forwarded"),
+        }
+
+        // Clean up
+        client1.close().await.unwrap();
+        client2.close().await.unwrap();
     }
 }
