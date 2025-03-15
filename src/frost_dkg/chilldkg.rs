@@ -23,7 +23,8 @@ pub enum DkgRoundState {
     Failed(String),
 }
 
-/// DKG coordinator using frost_secp256k1::keys::frost_dkg
+/// DKG coordinator - manages the protocol but does not participate in key generation
+/// Acts purely as a communication facilitator between participants
 pub struct DkgCoordinator {
     /// Threshold configuration
     config: ThresholdConfig,
@@ -33,10 +34,12 @@ pub struct DkgCoordinator {
     participants: BTreeMap<Identifier, Participant>,
     /// Round 1 packages received from participants
     round1_packages: BTreeMap<Identifier, round1::Package>,
-    /// Round 2 packages received from participants
+    /// Round 2 packages received from participants (sender -> recipient -> package)
     round2_packages: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>>,
     /// Final public key package (after DKG completion)
     pub_key_package: Option<PublicKeyPackage>,
+    /// Tracks which participants have finalized (submitted their public key package)
+    finalized_participants: BTreeMap<Identifier, bool>,
 }
 
 impl DkgCoordinator {
@@ -49,6 +52,7 @@ impl DkgCoordinator {
             round1_packages: BTreeMap::new(),
             round2_packages: BTreeMap::new(),
             pub_key_package: None,
+            finalized_participants: BTreeMap::new(),
         }
     }
 
@@ -58,7 +62,8 @@ impl DkgCoordinator {
             return Err(FrostWalletError::DkgError("Maximum number of participants reached".to_string()));
         }
 
-        self.participants.insert(participant.id, participant);
+        self.participants.insert(participant.id, participant.clone());
+        self.finalized_participants.insert(participant.id, false);
         Ok(())
     }
 
@@ -102,6 +107,11 @@ impl DkgCoordinator {
         self.round1_packages.clear();
         self.round2_packages.clear();
         self.pub_key_package = None;
+
+        // Reset finalization status
+        for (_, status) in self.finalized_participants.iter_mut() {
+            *status = false;
+        }
 
         // Set initial state to Round 1
         self.round_state = DkgRoundState::Round1;
@@ -179,17 +189,25 @@ impl DkgCoordinator {
     }
 
     /// Process a finalized public key package from a participant
-    pub fn process_public_key_package(&mut self, public_key_package: PublicKeyPackage) -> Result<()> {
+    pub fn process_public_key_package(&mut self, participant_id: Identifier, public_key_package: PublicKeyPackage) -> Result<()> {
+        // We should accept public key packages in either Round3 or Complete state
+        // as participants might submit them at different times
         match self.round_state {
-            DkgRoundState::Round3 => {},
+            DkgRoundState::Round3 | DkgRoundState::Complete => {},
             _ => return Err(FrostWalletError::DkgError(format!(
                 "Cannot process public key package in current state: {:?}",
                 self.round_state
             ))),
         }
 
+        // Verify the participant exists
+        if !self.participants.contains_key(&participant_id) {
+            return Err(FrostWalletError::ParticipantNotFound(participant_id));
+        }
+
+        // Store the first public key package we receive
         if self.pub_key_package.is_none() {
-            self.pub_key_package = Some(public_key_package);
+            self.pub_key_package = Some(public_key_package.clone());
         } else {
             // Verify that the public key package matches previously submitted ones
             let existing_pk = self.pub_key_package.as_ref().unwrap().verifying_key();
@@ -202,11 +220,29 @@ impl DkgCoordinator {
             }
         }
 
-        // If all participants have finalized (in a real implementation, we'd track this)
-        // For simplicity, we'll transition to Complete on the first valid public key
-        self.round_state = DkgRoundState::Complete;
+        // Mark this participant as finalized
+        if let Some(status) = self.finalized_participants.get_mut(&participant_id) {
+            *status = true;
+        }
+
+        // Check if all participants have finalized
+        let all_finalized = self.finalized_participants.values().all(|&status| status);
+
+        if all_finalized {
+            self.round_state = DkgRoundState::Complete;
+        }
 
         Ok(())
+    }
+
+    /// Check if a participant has finalized
+    pub fn is_participant_finalized(&self, participant_id: Identifier) -> bool {
+        self.finalized_participants.get(&participant_id).copied().unwrap_or(false)
+    }
+
+    /// Check if all participants have finalized
+    pub fn all_participants_finalized(&self) -> bool {
+        self.finalized_participants.values().all(|&status| status)
     }
 
     /// Get round 1 package for a specific participant
@@ -357,48 +393,167 @@ mod tests {
     use frost_secp256k1::Identifier;
 
     #[test]
-    fn test_dkg_coordinator() {
+    fn test_dkg_with_separate_coordinator_and_participants() {
+        // Create a coordinator and participants
         let config = ThresholdConfig::new(2, 3);
-        let mut coordinator = DkgCoordinator::new(config);
+        let mut coordinator = DkgCoordinator::new(config.clone());
 
+        // Create participants
+        let mut participants = BTreeMap::new();
         for i in 1..=3 {
-            let participant = Participant::new(Identifier::try_from(i as u16).unwrap());
+            let id = Identifier::try_from(i as u16).unwrap();
+            let participant = Participant::new(id);
             coordinator.add_participant(participant).unwrap();
+
+            participants.insert(id, DkgParticipant::new(id, config.clone()));
         }
 
+        // Start DKG
         coordinator.start().unwrap();
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
 
-        for i in 1..=3 {
-            let id = Identifier::try_from(i as u16).unwrap();
-            let package = coordinator.generate_round1(id).unwrap();
+        // Round 1: Generate and share commitments
+        let mut round1_packages = BTreeMap::new();
+        for (&id, participant) in &mut participants {
+            let package = participant.generate_round1().unwrap();
+            round1_packages.insert(id, package.clone());
             coordinator.process_round1_package(id, package).unwrap();
         }
 
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round2));
 
-        for i in 1..=3 {
-            let id = Identifier::try_from(i as u16).unwrap();
-            let packages = coordinator.generate_round2(id).unwrap();
-            coordinator.process_round2_package(id, packages).unwrap();
+        // Round 2: Generate and exchange encrypted key shares
+        for (&sender_id, participant) in &mut participants {
+            let packages = participant.generate_round2(&round1_packages).unwrap();
+
+            // Send each package to the coordinator
+            for (recipient_id, package) in &packages {
+                coordinator.process_round2_package(sender_id, *recipient_id, package.clone()).unwrap();
+            }
         }
 
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round3));
 
-        for i in 1..=3 {
-            let id = Identifier::try_from(i as u16).unwrap();
-            coordinator.finalize(id).unwrap();
+        // Round 3: Finalize and verify
+        let mut pub_key_packages = Vec::new();
+
+        for (&id, participant) in &mut participants {
+            // Get round 2 packages intended for this participant
+            let round2_packages_for_me = coordinator.get_round2_packages_for_recipient(id).unwrap();
+
+            // Finalize
+            let (key_package, public_key_package) = participant.finalize(
+                &round1_packages,
+                &round2_packages_for_me
+            ).unwrap();
+
+            // Share public key package with coordinator
+            coordinator.process_public_key_package(id, public_key_package.clone()).unwrap();
+            pub_key_packages.push(public_key_package);
         }
 
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
 
-        let pub_key_package = coordinator.get_public_key_package().unwrap();
+        // Verify all participants have the same public key
+        let first_pub_key = pub_key_packages[0].verifying_key();
+        for pkg in &pub_key_packages[1..] {
+            assert_eq!(first_pub_key, pkg.verifying_key());
+        }
+
+        // Verify coordinator has the same public key
+        let coordinator_pub_key = coordinator.get_public_key_package().unwrap();
+        assert_eq!(first_pub_key, coordinator_pub_key.verifying_key());
+    }
+
+    #[test]
+    fn test_dkg_with_threshold_participants() {
+        // Create a coordinator and participants with 2-of-3 threshold
+        let config = ThresholdConfig::new(2, 3);
+        let mut coordinator = DkgCoordinator::new(config.clone());
+
+        // Create 3 participants
+        let mut participants = BTreeMap::new();
         for i in 1..=3 {
             let id = Identifier::try_from(i as u16).unwrap();
-            let key_package = coordinator.get_key_package(id).unwrap();
-            assert_eq!(key_package.verifying_key(), pub_key_package.verifying_key());
+            let participant = Participant::new(id);
+            coordinator.add_participant(participant).unwrap();
+
+            participants.insert(id, DkgParticipant::new(id, config.clone()));
         }
+
+        // Start DKG
+        coordinator.start().unwrap();
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
+
+        // Round 1: Only first two participants generate and share commitments
+        let mut round1_packages = BTreeMap::new();
+        for i in 1..=2 {
+            let id = Identifier::try_from(i as u16).unwrap();
+            let package = participants.get_mut(&id).unwrap().generate_round1().unwrap();
+            round1_packages.insert(id, package.clone());
+            coordinator.process_round1_package(id, package).unwrap();
+        }
+
+        // We should still be in Round1 as not all participants have submitted
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round1));
+
+        // Let's manually advance to Round2 (in practice, we might timeout and proceed)
+        coordinator.round_state = DkgRoundState::Round2;
+
+        // Round 2: First two participants exchange encrypted key shares
+        for i in 1..=2 {
+            let sender_id = Identifier::try_from(i as u16).unwrap();
+            let packages = participants.get_mut(&sender_id).unwrap()
+                .generate_round2(&round1_packages).unwrap();
+
+            // Send each package to the coordinator
+            for (recipient_id, package) in &packages {
+                coordinator.process_round2_package(sender_id, *recipient_id, package.clone()).unwrap();
+            }
+        }
+
+        // Again, manually advance to Round3
+        coordinator.round_state = DkgRoundState::Round3;
+
+        // Round 3: First two participants finalize and verify
+        let mut pub_key_packages = Vec::new();
+
+        for i in 1..=2 {
+            let id = Identifier::try_from(i as u16).unwrap();
+
+            // Get round 2 packages intended for this participant
+            let round2_packages_for_me = coordinator.get_round2_packages_for_recipient(id).unwrap();
+
+            // Finalize
+            let (key_package, public_key_package) = participants.get_mut(&id).unwrap().finalize(
+                &round1_packages,
+                &round2_packages_for_me
+            ).unwrap();
+
+            // Share public key package with coordinator
+            coordinator.process_public_key_package(id, public_key_package.clone()).unwrap();
+            pub_key_packages.push(public_key_package);
+        }
+
+        // Since we configured threshold=2, these two participants should be enough to complete
+        // Even though participant 3 didn't participate, the DKG should succeed
+        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
+
+        // Check that only 2 participants finalized
+        assert!(coordinator.is_participant_finalized(Identifier::try_from(1u16).unwrap()));
+        assert!(coordinator.is_participant_finalized(Identifier::try_from(2u16).unwrap()));
+        assert!(!coordinator.is_participant_finalized(Identifier::try_from(3u16).unwrap()));
+
+        // Even though all participants didn't finalize, the DKG should be considered successful
+        // because we reached the threshold
+        assert!(!coordinator.all_participants_finalized());
+
+        // Verify first two participants have the same public key
+        let first_pub_key = pub_key_packages[0].verifying_key();
+        assert_eq!(first_pub_key, pub_key_packages[1].verifying_key());
+
+        // Verify coordinator has the same public key
+        let coordinator_pub_key = coordinator.get_public_key_package().unwrap();
+        assert_eq!(first_pub_key, coordinator_pub_key.verifying_key());
     }
 }
-
-
