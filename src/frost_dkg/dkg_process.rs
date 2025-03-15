@@ -80,7 +80,6 @@ impl DkgProcessController {
     ) -> Self {
         let coordinator = DkgCoordinator::new(config.clone());
         let processes = ProcessCoordinator::new();
-        let expected = config.total_participants as usize;
 
         let expected = config.total_participants as usize;
 
