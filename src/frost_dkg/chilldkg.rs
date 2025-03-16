@@ -29,13 +29,13 @@ pub struct DkgCoordinator {
     /// Threshold configuration
     config: ThresholdConfig,
     /// Current round state
-    round_state: DkgRoundState,
+    pub(crate) round_state: DkgRoundState,
     /// Participants in the DKG
     participants: BTreeMap<Identifier, Participant>,
     /// Round 1 packages received from participants
-    round1_packages: BTreeMap<Identifier, round1::Package>,
+    pub(crate) round1_packages: BTreeMap<Identifier, round1::Package>,
     /// Round 2 packages received from participants (sender -> recipient -> package)
-    round2_packages: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>>,
+    pub(crate) round2_packages: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>>,
     /// Final public key package (after DKG completion)
     pub_key_package: Option<PublicKeyPackage>,
     /// Tracks which participants have finalized (submitted their public key package)
