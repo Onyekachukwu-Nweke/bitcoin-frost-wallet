@@ -36,10 +36,6 @@ pub struct DkgCoordinator {
     pub(crate) round1_packages: BTreeMap<Identifier, round1::Package>,
     /// Round 2 packages received from participants (sender -> recipient -> package)
     pub(crate) round2_packages: BTreeMap<Identifier, BTreeMap<Identifier, round2::Package>>,
-    /// Final public key package (after DKG completion)
-    pub_key_package: Option<PublicKeyPackage>,
-    /// Tracks which participants have finalized (submitted their public key package)
-    finalized_participants: BTreeMap<Identifier, bool>,
 }
 
 impl DkgCoordinator {
@@ -51,8 +47,6 @@ impl DkgCoordinator {
             participants: BTreeMap::new(),
             round1_packages: BTreeMap::new(),
             round2_packages: BTreeMap::new(),
-            pub_key_package: None,
-            finalized_participants: BTreeMap::new(),
         }
     }
 
@@ -63,7 +57,6 @@ impl DkgCoordinator {
         }
 
         self.participants.insert(participant.id, participant.clone());
-        self.finalized_participants.insert(participant.id, false);
         Ok(())
     }
 
@@ -94,7 +87,6 @@ impl DkgCoordinator {
 
     /// Start the DKG process
     pub fn start(&mut self) -> Result<()> {
-        // Verify we have enough participants
         if self.participants.len() < self.config.threshold as usize {
             return Err(FrostWalletError::DkgError(format!(
                 "Not enough participants: have {}, need at least {}",
@@ -103,17 +95,8 @@ impl DkgCoordinator {
             )));
         }
 
-        // Reset state
         self.round1_packages.clear();
         self.round2_packages.clear();
-        self.pub_key_package = None;
-
-        // Reset finalization status
-        for (_, status) in self.finalized_participants.iter_mut() {
-            *status = false;
-        }
-
-        // Set initial state to Round 1
         self.round_state = DkgRoundState::Round1;
 
         Ok(())
@@ -121,7 +104,6 @@ impl DkgCoordinator {
 
     /// Process a round 1 package from a participant
     pub fn process_round1_package(&mut self, participant_id: Identifier, package: round1::Package) -> Result<()> {
-        // Verify we're in the right round
         match self.round_state {
             DkgRoundState::Round1 => {},
             _ => return Err(FrostWalletError::DkgError(format!(
@@ -130,17 +112,13 @@ impl DkgCoordinator {
             ))),
         }
 
-        // Verify the participant exists
         if !self.participants.contains_key(&participant_id) {
             return Err(FrostWalletError::ParticipantNotFound(participant_id));
         }
 
-        // Store the package
         self.round1_packages.insert(participant_id, package);
 
-        // Check if we have all round 1 packages
         if self.round1_packages.len() == self.participants.len() {
-            // Advance to Round 2
             self.round_state = DkgRoundState::Round2;
         }
 
@@ -165,15 +143,12 @@ impl DkgCoordinator {
             return Err(FrostWalletError::ParticipantNotFound(recipient_id));
         }
 
-        // Create entry for this sender if it doesn't exist
         if !self.round2_packages.contains_key(&participant_id) {
             self.round2_packages.insert(participant_id, BTreeMap::new());
         }
 
-        // Store the package
         self.round2_packages.get_mut(&participant_id).unwrap().insert(recipient_id, package);
 
-        // Check if we have all round 2 packages
         let expected_packages = self.participants.len() * (self.participants.len() - 1);
         let mut current_packages = 0;
 
@@ -182,67 +157,10 @@ impl DkgCoordinator {
         }
 
         if current_packages == expected_packages {
-            self.round_state = DkgRoundState::Round3;
+            self.round_state = DkgRoundState::Round3; // Transition to Round 3, but coordinator will finish here
         }
 
         Ok(())
-    }
-
-    /// Process a finalized public key package from a participant
-    pub fn process_public_key_package(&mut self, participant_id: Identifier, public_key_package: PublicKeyPackage) -> Result<()> {
-        // We should accept public key packages in either Round3 or Complete state
-        // as participants might submit them at different times
-        match self.round_state {
-            DkgRoundState::Round3 | DkgRoundState::Complete => {},
-            _ => return Err(FrostWalletError::DkgError(format!(
-                "Cannot process public key package in current state: {:?}",
-                self.round_state
-            ))),
-        }
-
-        // Verify the participant exists
-        if !self.participants.contains_key(&participant_id) {
-            return Err(FrostWalletError::ParticipantNotFound(participant_id));
-        }
-
-        // Store the first public key package we receive
-        if self.pub_key_package.is_none() {
-            self.pub_key_package = Some(public_key_package.clone());
-        } else {
-            // Verify that the public key package matches previously submitted ones
-            let existing_pk = self.pub_key_package.as_ref().unwrap().verifying_key();
-            let new_pk = public_key_package.verifying_key();
-
-            if existing_pk != new_pk {
-                return Err(FrostWalletError::VerificationError(
-                    "Public key package doesn't match previously submitted ones".to_string()
-                ));
-            }
-        }
-
-        // Mark this participant as finalized
-        if let Some(status) = self.finalized_participants.get_mut(&participant_id) {
-            *status = true;
-        }
-
-        // Check if all participants have finalized
-        let all_finalized = self.finalized_participants.values().all(|&status| status);
-
-        if all_finalized {
-            self.round_state = DkgRoundState::Complete;
-        }
-
-        Ok(())
-    }
-
-    /// Check if a participant has finalized
-    pub fn is_participant_finalized(&self, participant_id: Identifier) -> bool {
-        self.finalized_participants.get(&participant_id).copied().unwrap_or(false)
-    }
-
-    /// Check if all participants have finalized
-    pub fn all_participants_finalized(&self) -> bool {
-        self.finalized_participants.values().all(|&status| status)
     }
 
     /// Get round 1 package for a specific participant
@@ -272,12 +190,6 @@ impl DkgCoordinator {
         }
 
         Ok(result)
-    }
-
-    /// Get the public key package
-    pub fn get_public_key_package(&self) -> Result<PublicKeyPackage> {
-        self.pub_key_package.clone()
-            .ok_or_else(|| FrostWalletError::DkgError("DKG not yet complete".to_string()))
     }
 }
 
@@ -362,6 +274,9 @@ impl DkgParticipant {
             .map(|(id, pkg)| (*id, pkg.clone()))
             .collect();
 
+        println!("round 2 packages len: {}", round2_packages.len());
+        println!("other_round1_packages len: {}", other_round1_packages.len());
+
         let (key_package, public_key_package) = part3(
             &round2_secret,
             &other_round1_packages,
@@ -434,7 +349,7 @@ mod tests {
 
         assert!(matches!(coordinator.get_round_state(), DkgRoundState::Round3));
 
-        // Round 3: Finalize and verify
+        // Round 3: Finalize locally (no coordinator involvement)
         let mut pub_key_packages = Vec::new();
 
         for (&id, participant) in &mut participants {
@@ -442,17 +357,13 @@ mod tests {
             let round2_packages_for_me = coordinator.get_round2_packages_for_recipient(id).unwrap();
 
             // Finalize
-            let (key_package, public_key_package) = participant.finalize(
+            let (_key_package, public_key_package) = participant.finalize(
                 &round1_packages,
                 &round2_packages_for_me
             ).unwrap();
 
-            // Share public key package with coordinator
-            coordinator.process_public_key_package(id, public_key_package.clone()).unwrap();
             pub_key_packages.push(public_key_package);
         }
-
-        assert!(matches!(coordinator.get_round_state(), DkgRoundState::Complete));
 
         // Verify all participants have the same public key
         let first_pub_key = pub_key_packages[0].verifying_key();
@@ -460,8 +371,8 @@ mod tests {
             assert_eq!(first_pub_key, pkg.verifying_key());
         }
 
-        // Verify coordinator has the same public key
-        let coordinator_pub_key = coordinator.get_public_key_package().unwrap();
-        assert_eq!(first_pub_key, coordinator_pub_key.verifying_key());
+        // Note: Coordinator no longer holds or returns a public key package
+        // The test now verifies participant consistency only
+        log::info!("DKG completed successfully with consistent public keys among participants.");
     }
 }
