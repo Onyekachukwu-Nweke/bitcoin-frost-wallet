@@ -653,66 +653,65 @@ mod tests {
         coordinator.cleanup().await.unwrap();
     }
 
-    // #[tokio::test]
-    // async fn test_dkg_with_different_threshold() {
-    //     // Use different port for each test to avoid conflicts
-    //     let port = 35001;
-    //     let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    //
-    //     // Create a 3-of-5 threshold configuration for this test
-    //     // Note: This means 5 actual participants, not including the coordinator
-    //     let config = ThresholdConfig::new(3, 5);
-    //
-    //     // Initialize coordinator (not a participant)
-    //     let coordinator_id = Identifier::try_from(1u16).unwrap();
-    //     let mut coordinator = DkgProcessController::new(coordinator_id, config.clone(), port);
-    //     coordinator.start_server().await.unwrap();
-    //
-    //     // Initialize 5 participants (coordinator is NOT counted as a participant)
-    //     let mut participants = Vec::new();
-    //     let mut participant_tasks = Vec::new();
-    //
-    //     for i in 2..=6 { // Creating 5 participants with IDs 2-6
-    //         let id = Identifier::try_from(i).unwrap();
-    //         let mut participant = DkgParticipantProcess::new(id, config.clone());
-    //
-    //         // Connect to coordinator
-    //         participant.connect_to_coordinator(server_addr).await.unwrap();
-    //
-    //         // Add to coordinator's list (for tracking only)
-    //         coordinator.add_participant(Participant::new(id)).unwrap();
-    //
-    //         participants.push(participant);
-    //     }
-    //
-    //     // Wait for connections to be established
-    //     tokio::time::sleep(Duration::from_millis(100)).await;
-    //
-    //     // Start participant processes in separate tasks
-    //     for mut participant in participants {
-    //         let task = tokio::spawn(async move {
-    //             participant.run_dkg().await.unwrap()
-    //         });
-    //         participant_tasks.push(task);
-    //     }
-    //
-    //     // Run coordinator (only facilitates communication)
-    //     let pub_key_package = coordinator.run_dkg().await.unwrap();
-    //
-    //     // Wait for all participants to complete
-    //     let mut key_packages = Vec::new();
-    //     for task in participant_tasks {
-    //         key_packages.push(task.await.unwrap());
-    //     }
-    //
-    //     // Verify all participants derived the same public key
-    //     let first_key = &key_packages[0].verifying_key();
-    //     for key_package in &key_packages {
-    //         assert_eq!(key_package.verifying_key(), *first_key);
-    //     }
-    //     assert_eq!(*first_key, pub_key_package.verifying_key());
-    //
-    //     // Clean up
-    //     coordinator.cleanup().await.unwrap();
-    // }
+    #[tokio::test]
+    async fn test_dkg_with_different_threshold() {
+        // Use different port for each test to avoid conflicts
+        let port = 35001;
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Create a 3-of-5 threshold configuration for this test
+        // Note: This means 5 actual participants, not including the coordinator
+        let config = ThresholdConfig::new(3, 5);
+
+        // Initialize coordinator (not a participant)
+        let coordinator_id = Identifier::try_from(1u16).unwrap();
+        let mut coordinator = DkgProcessController::new(coordinator_id, config.clone(), port);
+        coordinator.start_server().await.unwrap();
+
+        // Initialize 5 participants (coordinator is NOT counted as a participant)
+        let mut participants = Vec::new();
+        let mut participant_tasks = Vec::new();
+
+        for i in 2..=6 { // Creating 5 participants with IDs 2-6
+            let id = Identifier::try_from(i).unwrap();
+            let mut participant = DkgParticipantProcess::new(id, config.clone());
+
+            // Connect to coordinator
+            participant.connect_to_coordinator(server_addr).await.unwrap();
+
+            // Add to coordinator's list (for tracking only)
+            coordinator.add_participant(Participant::new(id)).unwrap();
+
+            participants.push(participant);
+        }
+
+        // Wait for connections to be established
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start participant processes in separate tasks
+        for mut participant in participants {
+            let task = tokio::spawn(async move {
+                participant.run_dkg().await.unwrap()
+            });
+            participant_tasks.push(task);
+        }
+
+        // Run coordinator (only facilitates communication)
+        let pub_key_package = coordinator.run_dkg().await.unwrap();
+
+        // Wait for all participants to complete
+        let mut key_packages = Vec::new();
+        for task in participant_tasks {
+            key_packages.push(task.await.unwrap());
+        }
+
+        // Verify all participants derived the same public key
+        let first_key = &key_packages[0].verifying_key();
+        for key_package in &key_packages {
+            assert_eq!(key_package.verifying_key(), *first_key);
+        }
+
+        // Clean up
+        coordinator.cleanup().await.unwrap();
+    }
 }
