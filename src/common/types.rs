@@ -90,6 +90,38 @@ pub enum DkgMessage {
     Finish,
 }
 
+// /// Messages for distributed signing
+// #[derive(Debug, Clone, Serialize, Deserialize)]
+// pub enum SigningMessage {
+//     /// Start a new signing round for a message
+//     Start {
+//         /// The message to sign
+//         message: Vec<u8>,
+//         /// Participants involved in signing
+//         signers: Vec<Identifier>,
+//     },
+//     /// Nonce/commitment for round 1
+//     Round1 {
+//         /// Participant ID
+//         id: Identifier,
+//         /// Commitment data
+//         commitment: Vec<u8>,
+//     },
+//     /// Signature share for round 2
+//     Round2 {
+//         /// Participant ID
+//         id: Identifier,
+//         /// Signature share data
+//         signature_share: Vec<u8>,
+//     },
+//     /// Finalize signing by aggregating signature shares
+//     Finalize {
+//         /// All signature shares to aggregate
+//         shares: Vec<(Identifier, Vec<u8>)>,
+//     },
+// }
+
+// Update SigningMessage enum to include the new message types
 /// Messages for distributed signing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SigningMessage {
@@ -113,6 +145,16 @@ pub enum SigningMessage {
         id: Identifier,
         /// Signature share data
         signature_share: Vec<u8>,
+    },
+    /// Signing package for round 2
+    SigningPackage {
+        /// Serialized signing package
+        package: Vec<u8>,
+    },
+    /// Final signature after aggregation
+    FinalSignature {
+        /// Final aggregated signature
+        signature: Vec<u8>,
     },
     /// Finalize signing by aggregating signature shares
     Finalize {
