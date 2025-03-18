@@ -2,4 +2,4 @@
 pub const DKG_TIMEOUT_SECONDS: u64 = 120;
 
 /// Timeout for signing operations in seconds
-const SIGNING_TIMEOUT_SECONDS: u64 = 30;
+pub const SIGNING_TIMEOUT_SECONDS: u64 = 30;

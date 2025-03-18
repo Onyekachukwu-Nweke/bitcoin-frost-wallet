@@ -1,5 +1,6 @@
 use crate::common::errors::{FrostWalletError, Result};
-use crate::common::types::{IpcMessage, Participant, SigningMessage, ThresholdConfig};
+use crate::common::types::{IpcMessage, Participant, SigningMessage, ThresholdConfig, SigningRoundState};
+use crate::common::constants::SIGNING_TIMEOUT_SECONDS;
 use frost_secp256k1::{
     Identifier, SigningPackage, VerifyingKey, Signature,
     keys::{KeyPackage, PublicKeyPackage},
@@ -196,7 +197,7 @@ pub struct CoordinatorController {
     binary_path: Option<PathBuf>,
     pub_key_package: Option<PublicKeyPackage>,
     server_addr: SocketAddr,
-    round_state: crate::frost::tests::SigningRoundState,
+    round_state: SigningRoundState,
 }
 
 impl CoordinatorController {
@@ -215,7 +216,7 @@ impl CoordinatorController {
             binary_path: None,
             pub_key_package: None,
             server_addr,
-            round_state: crate::frost::tests::SigningRoundState::WaitingForParticipants,
+            round_state: SigningRoundState::WaitingForParticipants,
         }
     }
 
@@ -272,7 +273,7 @@ impl CoordinatorController {
         // Wait for all signers to connect
         let start_time = Instant::now();
         while self.ipc_clients.len() < signers.len() {
-            if start_time.elapsed() > Duration::from_secs(crate::frost::tests::SIGNING_TIMEOUT_SECONDS) {
+            if start_time.elapsed() > Duration::from_secs(SIGNING_TIMEOUT_SECONDS) {
                 return Err(FrostWalletError::TimeoutError(format!(
                     "Timeout waiting for participants to connect. Connected {}/{}",
                     self.ipc_clients.len(), signers.len()
@@ -281,7 +282,7 @@ impl CoordinatorController {
             sleep(Duration::from_millis(100)).await;
         }
 
-        self.round_state = crate::frost::tests::SigningRoundState::Round1;
+        self.round_state = SigningRoundState::Round1;
         self.coordinator.start_signing(message.clone())?;
 
         // Broadcast start message
@@ -321,7 +322,7 @@ impl CoordinatorController {
             signature: serialized_signature,
         })).await?;
 
-        self.round_state = crate::frost::tests::SigningRoundState::Complete;
+        self.round_state = SigningRoundState::Complete;
         self.coordinator.clear_signing_session();
 
         Ok(signature)
@@ -334,7 +335,7 @@ impl CoordinatorController {
         let start_time = Instant::now();
 
         while commitments_map.len() < expected_commitments {
-            if start_time.elapsed() > Duration::from_secs(crate::frost::tests::SIGNING_TIMEOUT_SECONDS) {
+            if start_time.elapsed() > Duration::from_secs(SIGNING_TIMEOUT_SECONDS) {
                 return Err(FrostWalletError::TimeoutError(format!(
                     "Timed out waiting for commitments. Received {}/{}",
                     commitments_map.len(), expected_commitments
@@ -364,7 +365,7 @@ impl CoordinatorController {
         }
 
         info!("Coordinator: Round 1 completed, received all commitments");
-        self.round_state = crate::frost::tests::SigningRoundState::Round2;
+        self.round_state = SigningRoundState::Round2;
         Ok(commitments_map)
     }
 
@@ -383,7 +384,7 @@ impl CoordinatorController {
         let start_time = Instant::now();
 
         while signature_shares.len() < expected_shares {
-            if start_time.elapsed() > Duration::from_secs(crate::frost::tests::SIGNING_TIMEOUT_SECONDS) {
+            if start_time.elapsed() > Duration::from_secs(SIGNING_TIMEOUT_SECONDS) {
                 return Err(FrostWalletError::TimeoutError(format!(
                     "Timed out waiting for signature shares. Received {}/{}",
                     signature_shares.len(), expected_shares
@@ -454,43 +455,4 @@ impl Drop for CoordinatorController {
     fn drop(&mut self) {
         let _ = self.processes.terminate_all();
     }
-}
-
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use frost_secp256k1::Identifier;
-    use frost_secp256k1::keys::IdentifierList;
-
-
-
-    // #[test]
-    // fn test_participant_operations() {
-    //     // Generate key packages
-    //     let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-    //
-    //     // Create a single participant
-    //     let participant_id = *key_packages.keys().next().unwrap();
-    //     let participant = FrostParticipant::new(
-    //         participant_id,
-    //         key_packages.get(&participant_id).unwrap().clone(),
-    //         pub_key_package.clone()
-    //     );
-    //
-    //     // Test generating commitment
-    //     let (commitment, nonces) = participant.generate_commitment().unwrap();
-    //     assert!(commitment);
-    //
-    //     // Create a fake signing package (normally provided by coordinator)
-    //     let mut commitments_map = BTreeMap::new();
-    //     commitments_map.insert(participant_id, commitment);
-    //     let message = b"Test participant operations";
-    //     let signing_package = SigningPackage::new(commitments_map, message);
-    //
-    //     // Test generating signature share
-    //     let signature_share = participant.generate_signature_share(&nonces, &signing_package).unwrap();
-    //     assert!(signature_share);
-    // }
 }

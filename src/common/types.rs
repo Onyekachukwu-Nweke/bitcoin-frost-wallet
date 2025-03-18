@@ -106,7 +106,7 @@ pub enum DkgRoundState {
 }
 
 #[derive(Debug, PartialEq)]
-enum SigningRoundState {
+pub enum SigningRoundState {
     WaitingForParticipants,
     Round1,
     Round2,
