@@ -11,7 +11,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{DkgMessage, IpcMessage, Participant, ProcessState, ThresholdConfig};
-use crate::frost_dkg::chilldkg::{DkgCoordinator, DkgParticipant, DkgRoundState};
+use crate::chilldkg::chilldkg::{DkgCoordinator, DkgParticipant, DkgRoundState};
 use crate::ipc::communication::{IpcClient, IpcServer};
 use crate::ipc::process::{ParticipantProcess, ProcessCoordinator};
 

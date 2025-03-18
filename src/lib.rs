@@ -1,5 +1,6 @@
 pub mod common;
-pub mod frost_dkg;
+pub mod frost;
 pub mod ipc;
 pub mod capnp_gen;
+mod chilldkg;
 

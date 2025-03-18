@@ -1,6 +1,6 @@
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{IpcMessage, Participant, SigningMessage, ThresholdConfig};
-use crate::frost_dkg::frost::{FrostCoordinator, FrostParticipant};
+use crate::frost::frost::{FrostCoordinator, FrostParticipant};
 use crate::ipc::{IpcServer, IpcClient, ProcessCoordinator};
 use frost_secp256k1::{
     Identifier,
@@ -427,7 +427,7 @@ impl Drop for SigningParticipant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frost_dkg::chilldkg::DkgCoordinator;
+    use crate::chilldkg::chilldkg::DkgCoordinator;
     use frost_secp256k1::VerifyingKey;
     use frost_secp256k1::keys::IdentifierList;
     use rand_core::OsRng;
