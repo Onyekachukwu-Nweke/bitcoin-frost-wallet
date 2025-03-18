@@ -105,6 +105,14 @@ pub enum DkgRoundState {
     Failed(String),
 }
 
+#[derive(Debug, PartialEq)]
+enum SigningRoundState {
+    WaitingForParticipants,
+    Round1,
+    Round2,
+    Complete,
+}
+
 // Update SigningMessage enum to include the new message types
 /// Messages for distributed signing
 #[derive(Debug, Clone, Serialize, Deserialize)]

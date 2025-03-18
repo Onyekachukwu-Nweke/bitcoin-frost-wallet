@@ -1,2 +1,3 @@
-pub mod frost;
-pub mod signing_process;
+pub mod coordinator;
+pub mod tests;
+mod participant;
