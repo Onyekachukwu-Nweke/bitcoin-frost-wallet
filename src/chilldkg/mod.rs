@@ -1,4 +1,3 @@
-pub mod chilldkg;
-pub mod dkg_process;
+pub mod tests;
 mod coordinator;
 mod participant;
