@@ -31,27 +31,6 @@ mod tests {
         (key_packages, pub_key_package)
     }
 
-    // Helper function to generate key packages for testing
-    fn generate_test_key_packages(threshold: u16, participants: u16) -> (BTreeMap<Identifier, KeyPackage>, PublicKeyPackage) {
-        let (secret_shares, pub_key_package) = frost_secp256k1::keys::generate_with_dealer(
-            participants,
-            threshold,
-            IdentifierList::Default,
-            &mut OsRng,
-        ).expect("Failed to generate key packages");
-
-        let key_packages: BTreeMap<_, _> = secret_shares.into_iter()
-            .map(|(id, ss)| {
-                let key_package = KeyPackage::try_from(ss)
-                    .map_err(|e| FrostWalletError::FrostError("Failed to convert to KeyPackage".to_string()))
-                    .unwrap();
-                (id, key_package)
-            })
-            .collect();
-
-        (key_packages, pub_key_package)
-    }
-
     // Helper function to create a set of frost participants
     fn create_frost_participants(
         key_packages: &BTreeMap<Identifier, KeyPackage>,
