@@ -2,7 +2,7 @@ use crate::common::errors::{FrostWalletError, Result};
 use crate::wallet::storage::WalletStorage;
 use bitcoin::{Address, Network, Script, ScriptBuf};
 use frost_secp256k1::VerifyingKey;
-use secp256k1::{Secp256k1, XOnlyPublicKey};
+use bitcoin::{secp256k1::{Secp256k1, XOnlyPublicKey, Message, VerifyOnly}};
 use std::str::FromStr;
 
 pub struct AddressManager {
@@ -11,7 +11,7 @@ pub struct AddressManager {
     /// Reference to wallet storage
     storage: WalletStorage,
     /// Secp256k1 context for address generation
-    secp: Secp256k1<secp256k1::VerifyOnly>,
+    secp: Secp256k1<VerifyOnly>,
 }
 
 impl AddressManager {
@@ -30,8 +30,8 @@ impl AddressManager {
         let public_key = self.storage.get_frost_public_key()?;
 
         // Convert to Secp256k1 X-only public key for Taproot
-        let pk_bytes = public_key.to_bytes();
-        let xonly_pk = XOnlyPublicKey::from_slice(&pk_bytes[..])
+        let pk_bytes = public_key.serialize().unwrap();
+        let xonly_pk = XOnlyPublicKey::from_slice(&pk_bytes[1..33])
             .map_err(|e| FrostWalletError::Secp256k1Error(e))?;
 
         // Create Taproot output script
