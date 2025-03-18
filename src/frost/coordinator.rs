@@ -1,30 +1,189 @@
 use crate::common::errors::{FrostWalletError, Result};
-use crate::common::types::{IpcMessage, Participant, SigningMessage, ThresholdConfig};
-use crate::frost_dkg::frost::{FrostCoordinator, FrostParticipant};
-use crate::ipc::{IpcServer, IpcClient, ProcessCoordinator};
+use crate::common::types::{IpcMessage, Participant, SigningMessage, ThresholdConfig, SigningRoundState};
+use crate::common::constants::SIGNING_TIMEOUT_SECONDS;
 use frost_secp256k1::{
-    Identifier,
-    Signature, SigningPackage,
+    Identifier, SigningPackage, VerifyingKey, Signature,
     keys::{KeyPackage, PublicKeyPackage},
     round1::{SigningCommitments, SigningNonces},
     round2::SignatureShare,
 };
+use rand_core::OsRng;
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use log::{debug, info};
 use tokio::time::{sleep, timeout};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use log::{debug, info, warn, error};
+use crate::ipc::{IpcClient, IpcServer, ProcessCoordinator};
 
-/// Timeout for signing operations in seconds
-const SIGNING_TIMEOUT_SECONDS: u64 = 30;
+/// FROST Coordinator - A non-signing entity that facilitates the threshold signing protocol
+/// The coordinator handles communication flow and aggregates results without having signing capability
+pub struct FrostCoordinator {
+    /// Threshold configuration
+    config: ThresholdConfig,
+    /// Participants in the signing session
+    participants: HashMap<Identifier, Participant>,
+    /// Current round commitments (Round 1)
+    commitments: Option<BTreeMap<Identifier, SigningCommitments>>,
+    /// Current message being signed
+    message: Option<Vec<u8>>,
+    /// Public key package for verification
+    pub_key_package: Option<PublicKeyPackage>,
+}
 
-#[derive(Debug, PartialEq)]
-enum SigningRoundState {
-    WaitingForParticipants,
-    Round1,
-    Round2,
-    Complete,
+impl FrostCoordinator {
+    /// Create a new FROST coordinator for signing
+    pub fn new(config: ThresholdConfig) -> Self {
+        Self {
+            config,
+            participants: HashMap::new(),
+            commitments: None,
+            message: None,
+            pub_key_package: None,
+        }
+    }
+
+    /// Set the public key package for signature verification
+    pub fn set_public_key_package(&mut self, pkg: PublicKeyPackage) {
+        self.pub_key_package = Some(pkg);
+    }
+
+    /// Add a participant
+    pub fn add_participant(&mut self, participant: Participant) {
+        self.participants.insert(participant.id, participant);
+    }
+
+    /// Get a participant by ID
+    pub fn get_participant(&self, id: Identifier) -> Option<&Participant> {
+        self.participants.get(&id)
+    }
+
+    /// Get all participants
+    pub fn get_participants(&self) -> &HashMap<Identifier, Participant> {
+        &self.participants
+    }
+
+    /// Get the count of commitments in the current signing session
+    pub fn get_commitments_count(&self) -> usize {
+        match &self.commitments {
+            Some(commitments) => commitments.len(),
+            None => 0,
+        }
+    }
+
+    /// Start a new signing session
+    /// This is called by the coordinator to initiate a signing session with a specific message
+    pub fn start_signing(&mut self, message: Vec<u8>) -> Result<()> {
+        // Ensure we have enough participants to meet the threshold
+        if self.participants.len() < self.config.threshold as usize {
+            return Err(FrostWalletError::NotEnoughSigners {
+                required: self.config.threshold,
+                provided: self.participants.len() as u16,
+            });
+        }
+
+        // Initialize commitments collection and store message
+        self.commitments = Some(BTreeMap::new());
+        self.message = Some(message);
+        Ok(())
+    }
+
+    /// Add a commitment from a participant (Round 1)
+    /// Called when the coordinator receives a commitment from a participant
+    pub fn add_commitment(&mut self, participant_id: Identifier, commitment: SigningCommitments) -> Result<()> {
+        // Ensure the participant is registered
+        if !self.participants.contains_key(&participant_id) {
+            return Err(FrostWalletError::ParticipantNotFound(participant_id));
+        }
+
+        // Store the commitment
+        if let Some(commitments_map) = &mut self.commitments {
+            commitments_map.insert(participant_id, commitment);
+            Ok(())
+        } else {
+            Err(FrostWalletError::InvalidState("No signing session in progress".to_string()))
+        }
+    }
+
+    /// Check if all required commitments have been received
+    pub fn has_all_commitments(&self, required_signers: &[Identifier]) -> bool {
+        if let Some(commitments) = &self.commitments {
+            required_signers.iter().all(|id| commitments.contains_key(id))
+        } else {
+            false
+        }
+    }
+
+    /// Create a signing package for Round 2
+    /// Called after all required commitments have been collected
+    pub fn create_signing_package(&self, signers: &[Identifier]) -> Result<SigningPackage> {
+        // Ensure we have commitments and a message
+        let commitments = self.commitments.as_ref()
+            .ok_or_else(|| FrostWalletError::InvalidState("No commitments available".to_string()))?;
+
+        let message = self.message.as_ref()
+            .ok_or_else(|| FrostWalletError::InvalidState("No message to sign".to_string()))?;
+
+        // Filter commitments to only include the specified signers
+        let filtered_commitments: BTreeMap<_, _> = commitments.iter()
+            .filter(|(id, _)| signers.contains(id))
+            .map(|(id, commitment)| (*id, commitment.clone()))
+            .collect();
+
+        // Ensure we have enough signers
+        if filtered_commitments.len() < self.config.threshold as usize {
+            return Err(FrostWalletError::NotEnoughSigners {
+                required: self.config.threshold,
+                provided: filtered_commitments.len() as u16,
+            });
+        }
+
+        // Create signing package
+        Ok(SigningPackage::new(filtered_commitments, message))
+    }
+
+    /// Aggregate signature shares into a complete signature (coordinator's final step)
+    /// Called after all signature shares have been collected
+    pub fn aggregate_signature_shares(
+        &self,
+        signing_package: &SigningPackage,
+        signature_shares: &BTreeMap<Identifier, SignatureShare>,
+    ) -> Result<Signature> {
+        let pub_key_package = self.pub_key_package.as_ref()
+            .ok_or_else(|| FrostWalletError::InvalidState("No public key package available for verification".to_string()))?;
+
+        // Aggregate the signature shares
+        let signature = frost_secp256k1::aggregate(
+            signing_package,
+            signature_shares,
+            pub_key_package,
+        ).map_err(|e| FrostWalletError::FrostError(e.to_string()))?;
+
+        Ok(signature)
+    }
+
+    /// Verify a signature (optional step for the coordinator)
+    pub fn verify_signature(&self, message: &[u8], signature: &Signature) -> Result<bool> {
+        let pub_key_package = self.pub_key_package.as_ref()
+            .ok_or_else(|| FrostWalletError::InvalidState("No public key package available for verification".to_string()))?;
+
+        // Verify the signature
+        let result = VerifyingKey::verify(
+            pub_key_package.verifying_key(),
+            message,
+            signature,
+        ).map(|()| true)
+            .unwrap_or(false);
+
+        Ok(result)
+    }
+
+    /// Clear the current signing session
+    /// Called to reset the coordinator state after signing completes
+    pub fn clear_signing_session(&mut self) {
+        self.commitments = None;
+        self.message = None;
+    }
 }
 
 /// Coordinator process controller - manages network communication for signing
@@ -295,232 +454,5 @@ impl CoordinatorController {
 impl Drop for CoordinatorController {
     fn drop(&mut self) {
         let _ = self.processes.terminate_all();
-    }
-}
-
-pub struct SigningParticipant {
-    local_id: Identifier,
-    frost_participant: FrostParticipant,
-    coordinator_client: Option<IpcClient>,
-    current_message: Option<Vec<u8>>,
-    current_signers: Vec<Identifier>,
-    current_nonces: Option<SigningNonces>,
-}
-
-impl SigningParticipant {
-    pub fn new(local_id: Identifier, key_package: KeyPackage, pub_key_package: PublicKeyPackage) -> Self {
-        Self {
-            local_id,
-            frost_participant: FrostParticipant::new(local_id, key_package, pub_key_package),
-            coordinator_client: None,
-            current_message: None,
-            current_signers: Vec::new(),
-            current_nonces: None,
-        }
-    }
-
-    pub async fn connect_to_coordinator(&mut self, coordinator_id: Identifier, addr: SocketAddr) -> Result<()> {
-        let mut client = IpcClient::new(self.local_id, coordinator_id);
-        client.connect(addr).await?;
-        self.coordinator_client = Some(client);
-        self.coordinator_client.as_ref().unwrap()
-            .send(IpcMessage::Handshake(self.local_id)).await?;
-        Ok(())
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        if self.coordinator_client.is_none() {
-            return Err(FrostWalletError::InvalidState("Not connected to coordinator".to_string()));
-        }
-
-        info!("Participant {:?} starting", self.local_id);
-
-        loop {
-            let message = {
-                let client = self.coordinator_client.as_mut().unwrap();
-                match client.receive().await {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Error receiving message: {:?}", e);
-                        return Err(e);
-                    }
-                }
-            };
-
-            match message {
-                IpcMessage::Signing(SigningMessage::Start { message, signers }) => {
-                    info!("Received signing request for {} signers", signers.len());
-                    debug!("Signers: {:?}", signers);
-
-                    if !signers.contains(&self.local_id) {
-                        debug!("I'm not a signer in this session, ignoring");
-                        continue;
-                    }
-
-                    self.current_message = Some(message);
-                    self.current_signers = signers;
-
-                    debug!("Generating commitment");
-                    let (commitment, nonces) = self.frost_participant.generate_commitment()?;
-                    self.current_nonces = Some(nonces);
-
-                    let serialized_commitment = bincode::serialize(&commitment)?;
-                    debug!("Sending commitment to coordinator");
-                    let client = self.coordinator_client.as_mut().unwrap();
-                    client.send(IpcMessage::Signing(SigningMessage::Round1 {
-                        id: self.local_id,
-                        commitment: serialized_commitment,
-                    })).await?;
-                    debug!("Commitment sent successfully");
-                },
-
-                IpcMessage::Signing(SigningMessage::SigningPackage { package }) => {
-                    info!("Received signing package from coordinator");
-                    let signing_package: SigningPackage = bincode::deserialize(&package)?;
-
-                    let nonces = self.current_nonces.as_ref()
-                        .ok_or_else(|| FrostWalletError::InvalidState("No signing nonces available".to_string()))?;
-
-                    debug!("Generating signature share");
-                    let signature_share = self.frost_participant.generate_signature_share(nonces, &signing_package)?;
-
-                    let serialized_share = bincode::serialize(&signature_share)?;
-                    debug!("Sending signature share to coordinator");
-                    let client = self.coordinator_client.as_mut().unwrap();
-                    client.send(IpcMessage::Signing(SigningMessage::Round2 {
-                        id: self.local_id,
-                        signature_share: serialized_share,
-                    })).await?;
-                    debug!("Signature share sent successfully");
-
-                    self.reset_signing_state();
-                },
-
-                IpcMessage::Signing(SigningMessage::FinalSignature { signature }) => {
-                    info!("Received final signature from coordinator");
-                },
-
-                IpcMessage::Handshake(id) => {
-                    debug!("Received handshake from {:?}", id);
-                },
-
-                _ => {
-                    warn!("Unexpected message type: {:?}", message);
-                }
-            }
-        }
-    }
-
-    fn reset_signing_state(&mut self) {
-        self.current_message = None;
-        self.current_signers.clear();
-        self.current_nonces = None;
-    }
-}
-
-impl Drop for SigningParticipant {
-    fn drop(&mut self) {
-        self.reset_signing_state();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::frost_dkg::chilldkg::DkgCoordinator;
-    use frost_secp256k1::VerifyingKey;
-    use frost_secp256k1::keys::IdentifierList;
-    use rand_core::OsRng;
-    use tempfile::tempdir;
-
-    fn generate_test_key_packages(threshold: u16, total: u16) -> (BTreeMap<Identifier, KeyPackage>, PublicKeyPackage) {
-        let (secret_shares, pub_key_package) = frost_secp256k1::keys::generate_with_dealer(
-            total,
-            threshold,
-            IdentifierList::Default,
-            &mut OsRng,
-        ).expect("Failed to generate key packages");
-
-        let key_packages: BTreeMap<_, _> = secret_shares.into_iter()
-            .map(|(id, ss)| {
-                let key_package = KeyPackage::try_from(ss)
-                    .map_err(|e| FrostWalletError::FrostError("Failed to convert to KeyPackage".to_string()))
-                    .unwrap();
-                (id, key_package)
-            })
-            .collect();
-
-        (key_packages, pub_key_package)
-    }
-
-    #[tokio::test]
-    async fn test_signing_coordinator_architecture() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let (key_packages, pub_key_package) = generate_test_key_packages(2, 3);
-        let coordinator_id = Identifier::try_from(1u16).unwrap();
-        let participant1_id = Identifier::try_from(2u16).unwrap();
-        let participant2_id = Identifier::try_from(3u16).unwrap();
-        let coordinator_port = 36000;
-
-        let config = ThresholdConfig::new(2, 3);
-        let mut coordinator = CoordinatorController::new(coordinator_id, config.clone(), coordinator_port);
-        coordinator.set_public_key_package(pub_key_package.clone()).unwrap();
-
-        coordinator.start_server().await.unwrap();
-        let coordinator_addr = coordinator.get_server_addr().unwrap();
-        println!("Coordinator server started at {:?}", coordinator_addr);
-
-        let mut participant1 = SigningParticipant::new(
-            participant1_id,
-            key_packages.get(&participant1_id).unwrap().clone(),
-            pub_key_package.clone(),
-        );
-        participant1.connect_to_coordinator(coordinator_id, coordinator_addr).await.unwrap();
-        println!("Participant 1 connected to coordinator");
-
-        let mut participant2 = SigningParticipant::new(
-            participant2_id,
-            key_packages.get(&participant2_id).unwrap().clone(),
-            pub_key_package.clone(),
-        );
-        participant2.connect_to_coordinator(coordinator_id, coordinator_addr).await.unwrap();
-        println!("Participant 2 connected to coordinator");
-
-        sleep(Duration::from_millis(200)).await;
-
-        coordinator.connect_to_participant(participant1_id, coordinator_addr).await.unwrap();
-        coordinator.connect_to_participant(participant2_id, coordinator_addr).await.unwrap();
-
-        sleep(Duration::from_millis(500)).await;
-        println!("All connections established");
-
-        let p1_handle = tokio::spawn(async move {
-            participant1.run().await
-        });
-        let p2_handle = tokio::spawn(async move {
-            participant2.run().await
-        });
-
-        sleep(Duration::from_millis(500)).await;
-        println!("Participants started, beginning signing process");
-
-        let message = b"Test message with coordinator architecture".to_vec();
-        let signers = vec![participant1_id, participant2_id];
-
-        let signature = coordinator.coordinate_signing(message.clone(), signers).await.unwrap();
-        println!("Signing completed, verifying signature");
-
-        let verification_result = VerifyingKey::verify(
-            pub_key_package.verifying_key(),
-            &message,
-            &signature,
-        );
-        assert!(verification_result.is_ok(), "Signature verification failed");
-
-        println!("Signature verified successfully!");
-        p1_handle.abort();
-        p2_handle.abort();
-        coordinator.cleanup().await.unwrap();
     }
 }
