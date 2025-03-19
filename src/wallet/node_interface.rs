@@ -17,10 +17,10 @@ pub struct NodeClient {
 
 impl NodeClient {
     /// Connect to Bitcoin node via Unix socket
-    pub fn connect() -> Result<Self> {
+    pub fn connect(socket_path: Option<&str>) -> Result<Self> {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Connect to Unix socket
-            let socket_path = "/tmp/bitcoin_wallet.sock"; // Make configurable
+            // Use provided socket path or default to "/tmp/bitcoin_wallet.sock"
+            let socket_path = socket_path.unwrap_or("/tmp/bitcoin_wallet.sock");
             let stream = UnixStream::connect(socket_path).await
                 .map_err(|e| FrostWalletError::IoError(e))?;
 
