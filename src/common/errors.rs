@@ -23,7 +23,7 @@ pub enum FrostWalletError {
     SerializationError(String),
 
     #[error("Secp256k1 error: {0}")]
-    Secp256k1Error(#[from] Secp256k1::Error),
+    Secp256k1Error(#[from] bitcoin::secp256k1::Error),
 
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
