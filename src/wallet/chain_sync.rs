@@ -41,11 +41,9 @@ async fn wallet_handle_startup_reorg(
 
 pub async fn wallet_startup(
     rpc: &RpcInterface,
-    local_id: frost_secp256k1::Identifier,
-    config: ThresholdConfig,
     coordinator_addr: std::net::SocketAddr,
 ) -> Result<Arc<Mutex<BdkFrostWallet>>, Box<dyn Error>> {
-    let mut wallet = BdkFrostWallet::new(local_id, config, coordinator_addr).await?;
+    let mut wallet = BdkFrostWallet::new().await?;
     rpc.show_progress("BDK FROST Wallet startup", 1, false).await;
 
     let node_tip = rpc.get_tip().await;

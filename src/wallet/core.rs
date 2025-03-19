@@ -6,15 +6,12 @@ use bdk_chain::{
 };
 use bdk_file_store::Store as BdkStore;
 use frost_secp256k1::{Identifier, Signature, VerifyingKey, keys::{KeyPackage, PublicKeyPackage}};
-use std::sync::{Arc, Mutex};
 use std::error::Error;
-use std::path::Path;
 use bdk_chain::bitcoin::hashes::Hash;
 use bdk_chain::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_chain::bitcoin::TapSighashType;
 use crate::common::types::ThresholdConfig;
 use crate::frost::coordinator::CoordinatorController;
-use crate::frost::participant::FrostParticipant;
 
 pub const NETWORK: Network = bitcoin::Network::Regtest;
 pub const BDK_STORE_PATH: &str = "bdk_core_store.dat";
@@ -74,20 +71,14 @@ impl BdkFrostWallet {
             &pub_key_package.verifying_key().serialize().unwrap()
         )?;
 
-        // Fix: Properly use TaprootBuilder
-        let tr_output = TaprootBuilder::new()
-            .finalize(&secp, xonly_pk);
+        // Create P2TR address directly without using TaprootBuilder
+        let address = Address::p2tr(&secp, xonly_pk, None, NETWORK);
+        let taproot_script = address.script_pubkey();
 
-        let taproot_script = match tr_output {
-            Ok(tr) => tr.script_pubkey(),
-            Err(e) => return Err(format!("Failed to create taproot output: {}", e).into()),
-        };
-
-        index.insert_spk((), taproot_script);
+        index.index_of_spk(taproot_script);
         let mut tx_graph = IndexedTxGraph::new(index);
 
         // Set up initial state or load from existing store
-        let mut wallet_key_package = key_package.clone();
         let mut wallet_pub_key_package = pub_key_package.clone();
 
         for cs in store.iter_changesets() {
@@ -115,7 +106,12 @@ impl BdkFrostWallet {
     }
 
     /// Connect to a FROST coordinator for signing operations
-    pub fn connect_coordinator(&mut self, coordinator_id: Identifier, addr: std::net::SocketAddr, config: ThresholdConfig) -> Result<(), Box<dyn Error>> {
+    pub fn connect_coordinator(
+        &mut self,
+        coordinator_id: Identifier,
+        addr: std::net::SocketAddr,
+        config: ThresholdConfig
+    ) -> Result<(), Box<dyn Error>> {
         let mut coordinator = CoordinatorController::new(coordinator_id, config, addr.port());
         coordinator.set_public_key_package(self.pub_key_package.clone())?;
         self.coordinator = Some(coordinator);
@@ -192,22 +188,22 @@ impl BdkFrostWallet {
             &self.pub_key_package.verifying_key().serialize().unwrap()
         )?;
 
-        let tr_output = TaprootBuilder::new().finalize(&secp, xonly_pk);
-        let script = match tr_output {
-            Ok(tr) => tr.script_pubkey(),
-            Err(e) => return Err(format!("Failed to create taproot output: {}", e).into()),
-        };
+        // Create P2TR address directly
+        let address = Address::p2tr(&secp, xonly_pk, None, NETWORK);
 
-        Ok(Address::from_script(&script, NETWORK)?)
+        // Set the network if needed
+        Ok(address)
     }
 
     /// Sign a transaction using FROST
     /// This method initializes the FROST participant if needed and properly signs
     /// Taproot inputs using the FROST threshold signature scheme
-    pub async fn sign_transaction(&mut self, mut tx: Transaction, signers: Vec<Identifier>, input_indices: Option<Vec<usize>>) -> Result<Transaction, Box<dyn Error>> {
-        // Ensure FROST participant is initialized
-        self.init_frost_participant()?;
-
+    pub async fn sign_transaction(
+        &mut self,
+        mut tx: Transaction,
+        signers: Vec<Identifier>,
+        input_indices: Option<Vec<usize>>
+    ) -> Result<Transaction, Box<dyn Error>> {
         let coordinator = self.coordinator.as_mut()
             .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Coordinator not connected")))?;
 
@@ -220,13 +216,12 @@ impl BdkFrostWallet {
         // Get UTXOs for proper sighash calculation
         let outpoints = self.tx_graph.index.outpoints().into_iter().map(|((_, _), op)| ((), *op));
         let graph = self.tx_graph.graph();
-        let utxos = graph.filter_chain_unspents(&self.chain, self.tip(), outpoints);
+        let utxos: Vec<_> = graph.filter_chain_unspents(&self.chain, self.tip(), outpoints).collect();
 
         // Create prevouts array for sighash calculation
         let mut prevouts = Vec::new();
         for input in &tx.input {
-            let utxo = utxos.iter()
-                .find(|(_, u)| u.outpoint == input.previous_output)
+            let utxo = utxos.iter().find(|(_, u)| u.outpoint == input.previous_output)
                 .ok_or_else(|| format!("Could not find UTXO for input {}", input.previous_output))?;
 
             prevouts.push(utxo.1.txout.clone());
