@@ -1,6 +1,6 @@
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{SigningRequest};
-use crate::frost::coordinator::FrostCoordinator;
+use crate::frost::coordinator::{CoordinatorController, FrostCoordinator};
 use crate::wallet::storage::WalletStorage;
 use crate::wallet::address::AddressManager;
 use bitcoin::{
@@ -134,7 +134,7 @@ impl TransactionManager {
         &self,
         unsigned_tx: Transaction,
         signing_request: SigningRequest,
-        frost_coordinator: &FrostCoordinator
+        frost_coordinator: &mut CoordinatorController
     ) -> Result<Transaction> {
         // Get selected UTXOs for this transaction
         let utxos = self.storage.get_utxos_for_tx(&unsigned_tx)?;
@@ -157,10 +157,11 @@ impl TransactionManager {
             // Sign with FROST
             // Note: In a real implementation, you would need to adapt this to how your
             // FROST coordinator actually signs messages
-            let signature = frost_coordinator.sign_message(&sighash, signing_request.signers.clone()).await?;
+
+            let signature = frost_coordinator.coordinate_signing(sighash, signing_request.signers.clone()).await.unwrap();
 
             // Create Schnorr signature witness
-            let schnorr_sig = signature.to_bytes().to_vec();
+            let schnorr_sig = signature.serialize().unwrap();
 
             // Set the witness for this input
             tx.input[i].witness = Witness::from_slice(&[schnorr_sig]);

@@ -1,4 +1,4 @@
-use crate::frost::coordinator::FrostCoordinator;
+use crate::frost::coordinator::CoordinatorController;
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{SigningRequest, ThresholdConfig};
 use crate::wallet::{AddressManager, TransactionManager, WalletStorage, NodeClient};
@@ -17,16 +17,16 @@ pub struct BitcoinWallet {
     /// Node client for communication with Bitcoin node
     node_client: NodeClient,
     /// Reference to FROST coordinator for signing
-    frost_coordinator: Option<FrostCoordinator>,
+    frost_coordinator: Option<CoordinatorController>,
 }
 
 impl BitcoinWallet {
     /// Create a new Bitcoin wallet
-    pub fn new(network: Network, storage_path: PathBuf) -> Result<Self> {
+    pub fn new(network: Network, storage_path: PathBuf, socket_path: Option<&str>) -> Result<Self> {
         let storage = WalletStorage::new(storage_path)?;
         let address_manager = AddressManager::new(network, &storage)?;
         let tx_manager = TransactionManager::new(network, &storage)?;
-        let node_client = NodeClient::connect()?;
+        let node_client = NodeClient::connect(socket_path)?;
 
         Ok(Self {
             network,
@@ -39,7 +39,7 @@ impl BitcoinWallet {
     }
 
     /// Connect to FROST coordinator
-    pub fn connect_frost_coordinator(&mut self, coordinator: FrostCoordinator) {
+    pub fn connect_frost_coordinator(&mut self, coordinator: CoordinatorController) {
         self.frost_coordinator = Some(coordinator);
     }
 
