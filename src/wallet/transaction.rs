@@ -3,12 +3,12 @@ use crate::common::types::{SigningRequest};
 use crate::frost::coordinator::FrostCoordinator;
 use crate::wallet::storage::WalletStorage;
 use crate::wallet::address::AddressManager;
-use bitcoin::{Address, Network, Transaction, TxIn, TxOut, Witness, Script, ScriptBuf, OutPoint, Txid, Amount};
-use frost_secp256k1::{Signature, Identifier};
-use secp256k1::{Secp256k1, XOnlyPublicKey, Message};
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::str::FromStr;
+use bitcoin::{
+    Address, Network, Transaction, TxIn, TxOut, Witness, Script, ScriptBuf,
+    OutPoint, Txid, Amount, secp256k1::{Secp256k1, XOnlyPublicKey, Message, VerifyOnly, schnorr},
+    Sequence, transaction, hashes::Hash, absolute::LockTime,
+    sighash::{TapSighash, TapSighashType, SighashCache}
+};
 
 /// Representation of an Unspent Transaction Output
 #[derive(Clone, Debug)]
@@ -26,7 +26,7 @@ pub struct TransactionManager {
     /// Reference to wallet storage
     storage: WalletStorage,
     /// Secp256k1 context for signature verification
-    secp: Secp256k1<secp256k1::VerifyOnly>,
+    secp: Secp256k1<VerifyOnly>,
 }
 
 impl TransactionManager {
@@ -90,7 +90,7 @@ impl TransactionManager {
                     vout: utxo.vout,
                 },
                 script_sig: ScriptBuf::new(),
-                sequence: 0xFFFFFFFF, // RBF disabled
+                sequence: Sequence(0xFFFFFFFF), // RBF disabled
                 witness: Witness::new(),
             }
         }).collect();
@@ -100,7 +100,7 @@ impl TransactionManager {
 
         // Add recipient output
         outputs.push(TxOut {
-            value: amount,
+            value: Amount::from_sat(amount),
             script_pubkey: recipient.script_pubkey(),
         });
 
@@ -110,15 +110,15 @@ impl TransactionManager {
             let change_address = address_manager.get_change_address()?;
 
             outputs.push(TxOut {
-                value: change_amount,
+                value: Amount::from_sat(change_amount),
                 script_pubkey: change_address.script_pubkey(),
             });
         }
 
         // Create unsigned transaction
         let tx = Transaction {
-            version: 2,
-            lock_time: 0,
+            version: transaction::Version(2),
+            lock_time: LockTime::ZERO,
             input: inputs,
             output: outputs,
         };
@@ -174,17 +174,42 @@ impl TransactionManager {
 
     /// Create a Taproot signature hash according to BIP 341
     fn create_taproot_sighash(&self, tx: &Transaction, input_index: usize, utxos: &[Utxo]) -> Result<Vec<u8>> {
-        // This is a simplified version - in a real implementation you'd use bitcoin::sighash::TapSighashType
-        // and bitcoin::util::taproot::taproot_builder to create the proper sighash
+        // Verify input index is valid
+        if input_index >= tx.input.len() {
+            return Err(FrostWalletError::InvalidState(format!("Invalid input index: {}", input_index)));
+        }
 
-        // For this PoC, we'll use a simple placeholder that creates a SHA256 hash of the transaction
-        // In a real implementation, you would need to follow the BIP 341 signature hash algorithm
-        let tx_bytes = bitcoin::consensus::serialize(tx);
-        let mut hasher = bitcoin::hashes::sha256::Hash::engine();
-        bitcoin::hashes::Hash::hash(&tx_bytes, &mut hasher);
-        let hash = bitcoin::hashes::Hash::from_engine(hasher);
+        // Find the corresponding UTXO
+        let utxo = utxos.iter()
+            .find(|u| {
+                u.txid == tx.input[input_index].previous_output.txid &&
+                    u.vout == tx.input[input_index].previous_output.vout
+            })
+            .ok_or_else(|| FrostWalletError::InvalidState(format!(
+                "UTXO not found for input {} ({}:{})",
+                input_index,
+                tx.input[input_index].previous_output.txid,
+                tx.input[input_index].previous_output.vout
+            )))?;
 
-        Ok(hash.as_ref().to_vec())
+        // Convert amount to bitcoin::Amount
+        let amount = Amount::from_sat(utxo.amount);
+
+        // Create sighash cache for the transaction
+        let mut sighash_cache = SighashCache::new(tx);
+
+        // Generate the signature hash for this input
+        // Using SIGHASH_ALL for Taproot (default)
+        let tap_sighash = sighash_cache.taproot_sign_hash(
+            input_index,
+            &bitcoin::ScriptBuf::new(), // No script path spending, so empty script
+            bitcoin::ScriptBuf::new(),  // No annex
+            TapSighashType::Default,    // SIGHASH_ALL in Taproot
+            amount
+        ).map_err(|e| FrostWalletError::SerializationError(format!("Sighash error: {:?}", e)))?;
+
+        // Convert to bytes
+        Ok(tap_sighash.as_ref().to_vec())
     }
 
     /// Estimate transaction fee
@@ -207,7 +232,7 @@ impl TransactionManager {
         let frost_pubkey = self.storage.get_frost_public_key()?;
 
         // Convert to XOnlyPublicKey
-        let pk_bytes = frost_pubkey.to_bytes();
+        let pk_bytes = frost_pubkey.serialize().unwrap();
         let xonly_pk = XOnlyPublicKey::from_slice(&pk_bytes[..])
             .map_err(|e| FrostWalletError::Secp256k1Error(e))?;
 
@@ -225,10 +250,10 @@ impl TransactionManager {
 
             // Verify using secp256k1
             // This is a simplified version - in a real implementation you'd use the proper BIP 341 verification
-            let message = Message::from_slice(&sighash)
+            let message = Message::from_digest_slice(&sighash)
                 .map_err(|e| FrostWalletError::SerializationError(format!("Invalid message: {:?}", e)))?;
 
-            let signature = secp256k1::schnorr::Signature::from_slice(sig_bytes)
+            let signature = schnorr::Signature::from_slice(sig_bytes)
                 .map_err(|e| FrostWalletError::SerializationError(format!("Invalid signature: {:?}", e)))?;
 
             if !self.secp.verify_schnorr(&signature, &message, &xonly_pk).is_ok() {
