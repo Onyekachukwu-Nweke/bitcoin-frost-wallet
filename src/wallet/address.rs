@@ -31,7 +31,7 @@ impl AddressManager {
 
         // Convert to Secp256k1 X-only public key for Taproot
         let pk_bytes = public_key.serialize().unwrap();
-        let xonly_pk = XOnlyPublicKey::from_slice(&pk_bytes[1..33])
+        let xonly_pk = XOnlyPublicKey::from_slice(&pk_bytes[..])
             .map_err(|e| FrostWalletError::Secp256k1Error(e))?;
 
         // Create Taproot output script

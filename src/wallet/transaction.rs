@@ -238,29 +238,44 @@ impl TransactionManager {
 
         // Verify each input
         for (i, utxo) in utxos.iter().enumerate() {
+            // Check if input index is valid
+            if i >= tx.input.len() {
+                return Err(FrostWalletError::InvalidState(format!("Input index {} out of bounds", i)));
+            }
+
             // Get the signature from witness
+            if tx.input[i].witness.is_empty() {
+                return Ok(false);
+            }
+
+            // Schnorr signatures in Taproot are always the first element in the witness
             if tx.input[i].witness.len() < 1 {
                 return Ok(false);
             }
 
             let sig_bytes = &tx.input[i].witness[0];
+            if sig_bytes.is_empty() {
+                return Ok(false);
+            }
 
-            // Create sighash
+            // Create sighash using the same method used for signing
             let sighash = self.create_taproot_sighash(tx, i, &utxos)?;
 
-            // Verify using secp256k1
-            // This is a simplified version - in a real implementation you'd use the proper BIP 341 verification
+            // Verify using secp256k1 Schnorr verification
             let message = Message::from_digest_slice(&sighash)
-                .map_err(|e| FrostWalletError::SerializationError(format!("Invalid message: {:?}", e)))?;
+                .map_err(|e| FrostWalletError::SerializationError(format!("Invalid message digest: {:?}", e)))?;
 
             let signature = schnorr::Signature::from_slice(sig_bytes)
-                .map_err(|e| FrostWalletError::SerializationError(format!("Invalid signature: {:?}", e)))?;
+                .map_err(|e| FrostWalletError::SerializationError(format!("Invalid signature format: {:?}", e)))?;
 
+            // Perform the actual verification
             if !self.secp.verify_schnorr(&signature, &message, &xonly_pk).is_ok() {
+                log::warn!("Signature verification failed for input {}", i);
                 return Ok(false);
             }
         }
 
+        // All signatures verified successfully
         Ok(true)
     }
 }

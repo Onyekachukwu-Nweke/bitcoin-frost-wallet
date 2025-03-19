@@ -60,7 +60,7 @@ impl WalletStorage {
     /// Save FROST public key
     pub fn save_frost_public_key(&self, public_key: &PublicKeyPackage) -> Result<()> {
         let verifying_key = public_key.verifying_key();
-        let key_bytes = verifying_key.to_bytes();
+        let key_bytes = verifying_key.serialize().unwrap();
 
         let mut state = self.state.lock().unwrap();
         state.frost_public_key = Some(key_bytes.to_vec());
@@ -69,11 +69,12 @@ impl WalletStorage {
     }
 
     /// Get FROST public key
+    // Tentative
     pub fn get_frost_public_key(&self) -> Result<VerifyingKey> {
         let state = self.state.lock().unwrap();
 
         if let Some(key_bytes) = &state.frost_public_key {
-            VerifyingKey::from_bytes(key_bytes.as_slice())
+            VerifyingKey::try_from(key_bytes.as_slice())
                 .map_err(|e| FrostWalletError::FrostError(format!("Invalid public key: {:?}", e)))
         } else {
             Err(FrostWalletError::InvalidState("No FROST public key available".to_string()))
