@@ -3,7 +3,7 @@ name = "bitcoin-frost-wallet"
 version = "0.1.0"
 edition = "2021"
 description = "A Bitcoin wallet using FROST/ChillDKG with multi-process architecture"
-build = "build.rs"
+#build = "build.rs"
 
 [dependencies]
 # FROST implementation
