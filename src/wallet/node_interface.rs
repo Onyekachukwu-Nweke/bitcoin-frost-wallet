@@ -2,7 +2,7 @@ use crate::common::errors::{FrostWalletError, Result};
 use bitcoin::{Transaction, Txid};
 use capnp::message::{Builder, HeapAllocator};
 use capnp_rpc::{RpcSystem, twoparty, rpc_twoparty_capnp};
-use std::net::SocketAddr;
+use futures_util::AsyncReadExt;
 use tokio::net::UnixStream;
 
 // Import generated Cap'n Proto code
@@ -59,10 +59,15 @@ impl NodeClient {
         let mut tx_request = message.init_root::<transaction::Builder>();
         tx_request.set_raw_tx(&tx_bytes);
 
-        // Send request
-        let response = self.wallet_client.broadcast_transaction(
-            tx_request.into_reader()
-        ).await.map_err(|e| FrostWalletError::IpcError(format!("RPC error: {}", e)))?;
+        // Create a request builder
+        let mut request = self.wallet_client.broadcast_transaction_request();
+
+        // Set the parameters on the request
+        request.get().set_tx(tx_request.into_reader());
+
+        // Send the request
+        let response = request.send().await
+            .map_err(|e| FrostWalletError::IpcError(format!("RPC error: {}", e)))?;
 
         // Parse response
         let result = response.get_result().map_err(|e|
