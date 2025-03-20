@@ -4,12 +4,12 @@ use bdk_chain::bitcoin;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::task::{self, JoinHandle};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use crate::capnp_schema::{chain_capnp, init_capnp, proxy_capnp};
 use crate::wallet::core::BdkFrostWallet;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
 use bdk_chain::bitcoin::consensus::Decodable;
 use bdk_chain::bitcoin::hashes::Hash;
+use crate::{chain_capnp, init_capnp, proxy_capnp};
 
 pub struct RpcInterface {
     rpc_handle: JoinHandle<Result<(), capnp::Error>>,

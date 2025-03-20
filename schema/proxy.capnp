@@ -4,7 +4,7 @@
 
 @0xcc316e3f71a040fb;
 
-using Cxx = import "c++.capnp";
+using Cxx = import "cpp.capnp";
 $Cxx.namespace("mp");
 
 annotation include(file): Text;

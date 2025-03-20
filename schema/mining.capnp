@@ -4,7 +4,7 @@
 
 @0xc77d03df6a41b505;
 
-using Cxx = import "c++.capnp";
+using Cxx = import "cpp.capnp";
 $Cxx.namespace("ipc::capnp::messages");
 
 using Common = import "common.capnp";

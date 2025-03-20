@@ -4,7 +4,7 @@
 
 @0x94f21a4864bd2c65;
 
-using Cxx = import "c++.capnp";
+using Cxx = import "cpp.capnp";
 $Cxx.namespace("ipc::capnp::messages");
 
 using Proxy = import "proxy.capnp";
