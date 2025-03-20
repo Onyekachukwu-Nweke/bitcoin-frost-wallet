@@ -1,3 +1,3 @@
 pub mod tests;
-mod coordinator;
-mod participant;
+pub mod coordinator;
+pub mod participant;

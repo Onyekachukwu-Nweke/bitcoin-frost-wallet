@@ -1,33 +1,41 @@
-@0xd28c9bd42c5ca179;
+# Copyright (c) 2024 The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-struct Identifier {
-  value @0 :UInt16;
+@0xcd2c6232cb484a28;
+
+using Cxx = import "cpp.capnp";
+$Cxx.namespace("ipc::capnp::messages");
+
+using Proxy = import "proxy.capnp";
+$Proxy.includeTypes("ipc/capnp/common-types.h");
+
+struct BlockRef $Proxy.wrap("interfaces::BlockRef") {
+    hash @0 :Data;
+    height @1 :Int32;
 }
 
-struct ThresholdConfig {
-  threshold @0 :UInt16;
-  totalParticipants @1 :UInt16;
+struct BilingualStr $Proxy.wrap("bilingual_str") {
+    original @0 :Text;
+    translated @1 :Text;
 }
 
-struct Context {
-  timestamp @0 :UInt64;
-  processId @1 :UInt32;
+struct Result(Value) {
+    value @0 :Value;
+    error @1: BilingualStr;
 }
 
-enum ProcessType {
-  coordinator @0;
-  participant @1;
+# Wrapper for util::Result<void>
+struct ResultVoid(Value) {
+    error @0: BilingualStr;
 }
 
-struct ProcessId {
-  type @0 :ProcessType;
-  id @1 :UInt16;
+struct Pair(Key, Value) {
+    key @0 :Key;
+    value @1 :Value;
 }
 
-struct Error {
-  code @0 :UInt16;
-  message @1 :Text;
+struct PairInt64(Key) {
+    key @0 :Key;
+    value @1 :Int64;
 }
-
-# Instead of generic Result, we need specific result types for each type
-# These are defined in the respective schema files that need them

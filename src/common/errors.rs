@@ -3,6 +3,7 @@ use frost_core::{Identifier, Error as FrostError};
 use thiserror::Error;
 use std::io;
 use std::sync::mpsc;
+use bitcoin::secp256k1::Secp256k1;
 
 #[derive(Error, Debug)]
 pub enum FrostWalletError {
@@ -21,11 +22,8 @@ pub enum FrostWalletError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
-    // #[error("Bitcoin error: {0}")]
-    // BitcoinError(#[from] bitcoin::Error),
-
     #[error("Secp256k1 error: {0}")]
-    Secp256k1Error(#[from] secp256k1::Error),
+    Secp256k1Error(#[from] bitcoin::secp256k1::Error),
 
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
@@ -47,6 +45,26 @@ pub enum FrostWalletError {
 
     #[error("Timeout error: {0}")]
     TimeoutError(String),
+
+    /// Bitcoin error
+    #[error("Bitcoin error: {0}")]
+    BitcoinError(String),
+
+    /// Bitcoin RPC error
+    #[error("Bitcoin RPC error: {0}")]
+    BitcoinRpcError(String),
+
+    /// CapnProto RPC error
+    #[error("CapnProto RPC error: {0}")]
+    CapnProtoError(String),
+
+    /// Wallet connection error
+    #[error("Wallet connection error: {0}")]
+    ConnectionError(String),
+
+    /// Insufficient funds error
+    #[error("Insufficient funds: {0}")]
+    InsufficientFunds(String),
 }
 
 impl From<mpsc::RecvError> for FrostWalletError {
@@ -73,9 +91,21 @@ impl From<bincode::Error> for FrostWalletError {
     }
 }
 
-// impl From<VerificationError> for FrostWalletError {
-//     fn from(e: VerificationError) -> Self {
-//         Self::VerificationError(format!("FROST verification error: {}", e))
+impl From<bitcoin::address::Error> for FrostWalletError {
+    fn from(err: bitcoin::address::Error) -> Self {
+        Self::BitcoinError(format!("Address error: {}", err))
+    }
+}
+
+impl From<bitcoin::consensus::encode::Error> for FrostWalletError {
+    fn from(err: bitcoin::consensus::encode::Error) -> Self {
+        Self::BitcoinError(format!("Encoding error: {}", err))
+    }
+}
+
+// impl From<bitcoin::hashes::Error> for FrostWalletError {
+//     fn from(err: bitcoin::hashes::Error) -> Self {
+//         Self::BitcoinError(format!("Hash error: {}", err))
 //     }
 // }
 

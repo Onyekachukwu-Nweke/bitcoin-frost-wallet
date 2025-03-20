@@ -1,7 +1,6 @@
 #![allow(warnings)]
 use crate::common::errors::{FrostWalletError, Result};
 use crate::common::types::{DkgMessage, IpcMessage, SigningMessage};
-use crate::capnp_gen::{serialize_message, deserialize_message};
 use frost_secp256k1::Identifier;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, TcpListener};
