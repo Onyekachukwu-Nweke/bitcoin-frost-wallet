@@ -1,6 +1,7 @@
 use crate::wallet::{rpc::RpcInterface, core::BdkFrostWallet};
 use std::sync::{Arc, Mutex};
 use std::error::Error;
+use frost_secp256k1::keys::PublicKeyPackage;
 use crate::common::types::ThresholdConfig;
 
 async fn wallet_startup_complete(
@@ -42,8 +43,10 @@ async fn wallet_handle_startup_reorg(
 pub async fn wallet_startup(
     rpc: &RpcInterface,
     coordinator_addr: std::net::SocketAddr,
+    pub_key_package: PublicKeyPackage,
+    store_path: Option<&str>,
 ) -> Result<Arc<Mutex<BdkFrostWallet>>, Box<dyn Error>> {
-    let mut wallet = BdkFrostWallet::new().await?;
+    let mut wallet = BdkFrostWallet::new(pub_key_package, store_path).unwrap();
     rpc.show_progress("BDK FROST Wallet startup", 1, false).await;
 
     let node_tip = rpc.get_tip().await;

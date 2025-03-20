@@ -82,7 +82,7 @@ impl BdkFrostWallet {
         let mut wallet_pub_key_package = pub_key_package.clone();
 
         for cs in store.iter_changesets() {
-            let cs = cs?;
+            let cs: ChangeSet = cs?;
             chain.apply_changeset(&cs.chain_cs)?;
             tx_graph.apply_changeset(cs.graph_cs);
             if let Some(pp) = cs.frost_pubkey_package {
@@ -90,15 +90,17 @@ impl BdkFrostWallet {
             }
         }
 
+        // Create wallet instance
         let mut wallet = Self {
             chain,
             tx_graph,
             store,
-            coordinator: None, // Start with no coordinator - will be created when needed
+            coordinator: None,
             pub_key_package: wallet_pub_key_package,
         };
 
-        if store.iter_changesets().next().is_none() {
+        // Check and store initial data if needed before returning
+        if wallet.store.iter_changesets().next().is_none() {
             wallet.store_frost_data()?;
         }
 
@@ -204,9 +206,6 @@ impl BdkFrostWallet {
         signers: Vec<Identifier>,
         input_indices: Option<Vec<usize>>
     ) -> Result<Transaction, Box<dyn Error>> {
-        let coordinator = self.coordinator.as_mut()
-            .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "Coordinator not connected")))?;
-
         // Determine which inputs to sign (all by default)
         let indices_to_sign = match input_indices {
             Some(indices) => indices,
@@ -216,47 +215,65 @@ impl BdkFrostWallet {
         // Get UTXOs for proper sighash calculation
         let outpoints = self.tx_graph.index.outpoints().into_iter().map(|((_, _), op)| ((), *op));
         let graph = self.tx_graph.graph();
-        let utxos: Vec<_> = graph.filter_chain_unspents(&self.chain, self.tip(), outpoints).collect();
+        let tip = self.tip();
+        let chain = &self.chain;
+
+        // Collect UTXOs into a Vec so we can search them multiple times
+        let utxos: Vec<_> = graph.filter_chain_unspents(chain, tip, outpoints).collect();
 
         // Create prevouts array for sighash calculation
         let mut prevouts = Vec::new();
         for input in &tx.input {
-            let utxo = utxos.iter().find(|(_, u)| u.outpoint == input.previous_output)
+            let utxo = utxos.iter()
+                .find(|(_, u)| u.outpoint == input.previous_output)
                 .ok_or_else(|| format!("Could not find UTXO for input {}", input.previous_output))?;
-
             prevouts.push(utxo.1.txout.clone());
         }
 
-        // Initialize sighash cache
-        let mut sighash_cache = SighashCache::new(&tx);
+        // Calculate sighashes for all inputs we need to sign
+        let mut sighashes = Vec::new();
+        {
+            let mut sighash_cache = SighashCache::new(&tx);
 
-        // Sign each input
-        for input_idx in indices_to_sign {
-            if input_idx >= tx.input.len() {
-                return Err(format!("Input index {} out of bounds for tx with {} inputs",
-                                   input_idx, tx.input.len()).into());
+            for &input_idx in &indices_to_sign {
+                if input_idx >= tx.input.len() {
+                    return Err(format!("Input index {} out of bounds for tx with {} inputs",
+                                       input_idx, tx.input.len()).into());
+                }
+
+                let sighash = sighash_cache.taproot_key_spend_signature_hash(
+                    input_idx,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default
+                )?;
+                sighashes.push((input_idx, sighash));
             }
+        }
 
-            // Calculate proper Taproot sighash
-            let sighash = sighash_cache.taproot_key_spend_signature_hash(
-                input_idx,
-                &Prevouts::All(&prevouts),
-                TapSighashType::Default  // SIGHASH_ALL
-            )?;
+        // Now handle the signing with coordinator in a separate scope
+        let signatures = {
+            let coordinator = self.coordinator.as_mut()
+                .ok_or("Coordinator not connected")?;
 
-            // Coordinate the signing process through FROST
-            let frost_signature = coordinator.coordinate_signing(sighash.to_byte_array().to_vec(), signers.clone()).await?;
+            let mut signatures = Vec::new();
+            for (input_idx, sighash) in sighashes {
+                let frost_signature = coordinator.coordinate_signing(
+                    sighash.to_byte_array().to_vec(),
+                    signers.clone()
+                ).await?;
 
-            // Format the signature for Taproot (schnorr signature + sighash flag)
-            let mut taproot_sig = frost_signature.serialize().unwrap();
-
-            // Append SIGHASH_ALL byte for Taproot
-            if taproot_sig.len() == 64 {  // Standard Schnorr signature length
-                taproot_sig.push(0x01);   // SIGHASH_ALL flag
+                let mut taproot_sig = frost_signature.serialize().unwrap();
+                if taproot_sig.len() == 64 {
+                    taproot_sig.push(0x01); // SIGHASH_ALL flag
+                }
+                signatures.push((input_idx, taproot_sig));
             }
+            signatures
+        };
 
-            // Update the witness data for this input
-            tx.input[input_idx].witness.clear(); // Clear any existing witness data
+        // Update the transaction witnesses
+        for (input_idx, taproot_sig) in signatures {
+            tx.input[input_idx].witness.clear();
             tx.input[input_idx].witness.push(taproot_sig.as_slice());
         }
 
